@@ -12,8 +12,8 @@ import java.lang.IllegalArgumentException
 import java.net.ServerSocket
 import java.net.Socket
 
-class UsbAdbStreamer(private val ctx: Context,
-                     private val port: Int?) : Streamer {
+class AdbStreamer(private val ctx: Context,
+                  private val port: Int?) : Streamer {
 
     private val TAG: String = "UsbAdbStreamer"
 
