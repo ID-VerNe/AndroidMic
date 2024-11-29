@@ -20,8 +20,7 @@ import com.example.androidMic.ui.components.ManagerButton
 import com.example.androidMic.ui.components.ManagerOutlinedTextField
 
 @Composable
-fun DialogWifiIpPort(vm: MainViewModel, expanded: MutableState<Boolean>) {
-
+fun DialogIpPort(vm: MainViewModel, expanded: MutableState<Boolean>) {
 
     val tempIp = rememberSaveable {
         mutableStateOf(vm.prefs.ip.getBlocking())
@@ -30,11 +29,8 @@ fun DialogWifiIpPort(vm: MainViewModel, expanded: MutableState<Boolean>) {
         mutableStateOf(vm.prefs.port.getBlocking())
     }
 
-    ManagerDialog(
+    BaseDialog(
         expanded,
-        onDismissRequest = {
-            //tempIp.value = uiStates.ip; tempPort.value = uiStates.port
-        }
     ) {
         Column(
             horizontalAlignment = Alignment.End
@@ -66,6 +62,7 @@ fun DialogWifiIpPort(vm: MainViewModel, expanded: MutableState<Boolean>) {
                 ManagerButton(
                     onClick = {
                         vm.setIpPort(tempIp.value, tempPort.value)
+                        expanded.value = false
                     },
                     text = stringResource(id = R.string.save),
                     modifier = Modifier.fillMaxWidth(0.6f)
@@ -76,7 +73,6 @@ fun DialogWifiIpPort(vm: MainViewModel, expanded: MutableState<Boolean>) {
                 // cancel Button
                 ManagerButton(
                     onClick = {
-                        //tempIp.value = uiStates.ip; tempPort.value = uiStates.port
                         expanded.value = false
                     },
                     text = stringResource(id = R.string.cancel),
