@@ -2,6 +2,5 @@
 <resources>
     <usb-accessory
         manufacturer="AndroidMic"
-        model="Android Mic USB Streamer"
-        version="1.0" />
+        model="AndroidMicUSBStreamer" />
 </resources>
