@@ -36,6 +36,8 @@ const REBIND_BACKOFF_FACTOR: u32 = 2;
 const KEEPALIVE_TIME: Duration = Duration::from_secs(10);
 /// interval between TCP keepalive probes
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
+/// number of unanswered probes before the connection is declared dead
+const KEEPALIVE_RETRIES: u32 = 5;
 
 pub struct TcpStreamer {
     ip: IpAddr,
@@ -155,7 +157,8 @@ impl StreamerTrait for TcpStreamer {
                 // read blocked on a half-open socket.
                 let keepalive = TcpKeepalive::new()
                     .with_time(KEEPALIVE_TIME)
-                    .with_interval(KEEPALIVE_INTERVAL);
+                    .with_interval(KEEPALIVE_INTERVAL)
+                    .with_retries(KEEPALIVE_RETRIES);
                 SockRef::from(&stream)
                     .set_tcp_keepalive(&keepalive)
                     .map_err(|e| ConnectError::HandShakeFailed("setting keepalive", e))?;
