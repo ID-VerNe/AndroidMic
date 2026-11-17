@@ -18,6 +18,8 @@
 
 
     <string name="drawerMode">Connection mode</string>
+    <string name="auto_connect">Auto connect</string>
+    <string name="auto_connect_summary">Start streaming automatically when a USB/ADB tunnel is available</string>
 
     <string name="drawerIpPort">IP:PORT</string>
     <string name="dialog_ip">IP</string>
