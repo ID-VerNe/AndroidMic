@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::{
     config::ConnectionMode,
@@ -14,8 +15,13 @@ use super::{
 
 pub struct AdbStreamer {
     tcp_streamer: TcpStreamer,
+    /// polls `adb devices` for the lifetime of this streamer, so a device
+    /// attached after startup gets its reverse proxy without another Connect
+    device_watch: JoinHandle<()>,
 }
 
+/// how often the device watcher runs `adb devices`
+const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// attempts to recreate the reverse proxy after the TCP listener came back
 const ADB_REVERSE_ATTEMPTS: u32 = 3;
 /// base delay between reverse proxy rebuild attempts
@@ -31,7 +37,9 @@ async fn get_connected_devices() -> Result<Vec<String>, ConnectError> {
     // Skip the first line which is "List of devices attached"
     for line in output.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
+        // only an authorized, ready device can accept `adb reverse`; skip
+        // `unauthorized` / `offline` entries
+        if parts.len() >= 2 && parts[1] == "device" {
             devices.push(parts[0].to_string());
         }
     }
@@ -126,12 +134,58 @@ async fn rebuild_reverse_proxies(port: u16) -> Result<(), ConnectError> {
     Err(last_error.unwrap_or(ConnectError::NoAdbDevice))
 }
 
+/// Poll `adb devices` for the lifetime of the streamer. The watcher is a
+/// separate task so it never cancels the TCP accept/handshake path.
+fn spawn_device_watch(port: u16, initially_present: bool) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut present = initially_present;
+
+        loop {
+            tokio::time::sleep(DEVICE_POLL_INTERVAL).await;
+
+            let devices = match get_connected_devices().await {
+                Ok(devices) => devices,
+                Err(e) => {
+                    warn!("adb device poll failed: {e}");
+                    continue;
+                }
+            };
+
+            let now_present = !devices.is_empty();
+
+            if now_present && !present {
+                info!("adb device attached: {devices:?}");
+                match rebuild_reverse_proxies(port).await {
+                    Ok(()) => present = true,
+                    Err(e) => warn!("can't create adb reverse proxy: {e}"),
+                }
+            } else if !now_present && present {
+                info!("adb device detached");
+                present = false;
+            }
+        }
+    })
+}
+
 pub async fn new(port: u16, stream_config: AudioStream) -> Result<AdbStreamer, ConnectError> {
     let tcp_streamer = tcp_streamer::new("127.0.0.1".parse().unwrap(), port, stream_config).await?;
+    let port = tcp_streamer.port;
 
-    recreate_reverse_proxies(tcp_streamer.port).await?;
+    let devices = get_connected_devices().await?;
+    let present = !devices.is_empty();
 
-    let streamer = AdbStreamer { tcp_streamer };
+    if present {
+        recreate_reverse_proxies(port).await?;
+    } else {
+        info!("no adb device at startup, waiting for one on port {port}");
+    }
+
+    let device_watch = spawn_device_watch(port, present);
+
+    let streamer = AdbStreamer {
+        tcp_streamer,
+        device_watch,
+    };
     Ok(streamer)
 }
 
@@ -179,6 +233,7 @@ impl StreamerTrait for AdbStreamer {
 
 impl Drop for AdbStreamer {
     fn drop(&mut self) {
+        self.device_watch.abort();
         let port = self.tcp_streamer.port;
         tokio::spawn(async move {
             let devices: Vec<String> = get_connected_devices().await.unwrap_or_default();

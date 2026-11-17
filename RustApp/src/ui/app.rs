@@ -121,6 +121,18 @@ pub enum ConnectionState {
     Listening,
 }
 
+fn is_adb_mode(mode: ConnectionMode) -> bool {
+    #[cfg(feature = "adb")]
+    {
+        matches!(mode, ConnectionMode::Adb)
+    }
+    #[cfg(not(feature = "adb"))]
+    {
+        let _ = mode;
+        false
+    }
+}
+
 fn tray_menu_state(state: ConnectionState) -> TrayMenuState {
     match state {
         ConnectionState::Default => TrayMenuState {
@@ -649,7 +661,10 @@ impl Application for AppState {
                 }
                 StreamerMsg::Ready(sender) => {
                     self.streamer = Some(sender);
-                    if config.auto_connect {
+                    // ADB mode starts the device watcher immediately: the whole
+                    // point of the feature is plugging the cable in without
+                    // clicking Connect on the PC.
+                    if config.auto_connect || is_adb_mode(config.connection_mode) {
                         return self.connect();
                     }
                 }
