@@ -291,6 +291,7 @@ impl AppState {
                 ConnectOption::Tcp {
                     ip,
                     port: config.port,
+                    keepalive: config.tcp_keepalive,
                 }
             }
             ConnectionMode::Udp => {
@@ -306,7 +307,10 @@ impl AppState {
                 }
             }
             #[cfg(feature = "adb")]
-            ConnectionMode::Adb => ConnectOption::Adb { port: config.port },
+            ConnectionMode::Adb => ConnectOption::Adb {
+                port: config.port,
+                keepalive: config.tcp_keepalive,
+            },
             #[cfg(feature = "usb")]
             ConnectionMode::Usb => ConnectOption::Usb,
         };

@@ -15,7 +15,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::{
     audio::process::ProcessCache,
-    config::ConnectionMode,
+    config::{ConnectionMode, TcpKeepaliveConfig},
     streamer::{CHECK_1, CHECK_2, StreamerMsg, WriteError},
 };
 
@@ -34,21 +34,13 @@ const REBIND_BACKOFF_FACTOR: u32 = 2;
 /// number of retries after the first failed bind before surfacing the bind error
 const REBIND_MAX_RETRIES: u32 = 6;
 
-/// idle time before the first TCP keepalive probe on an active connection
-const KEEPALIVE_TIME: Duration = Duration::from_secs(10);
-/// interval between TCP keepalive probes
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-/// number of unanswered probes before the connection is declared dead.
-/// Worst-case detection window: `KEEPALIVE_TIME + KEEPALIVE_INTERVAL * KEEPALIVE_RETRIES`
-/// = 10s + 2s * 5 = ~20s.
-const KEEPALIVE_RETRIES: u32 = 5;
-
 pub struct TcpStreamer {
     ip: IpAddr,
     pub port: u16,
     pub state: TcpStreamerState,
     stream_config: AudioStream,
     process_cache: ProcessCache,
+    keepalive: TcpKeepaliveConfig,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -66,10 +58,18 @@ pub async fn new(
     ip: IpAddr,
     port: u16,
     stream_config: AudioStream,
+    keepalive: TcpKeepaliveConfig,
 ) -> Result<TcpStreamer, ConnectError> {
     let listener = bind_reusable(ip, port).await?;
 
     let addr = TcpListener::local_addr(&listener).map_err(ConnectError::NoLocalAddress)?;
+
+    info!(
+        "tcp keepalive configured: time={}s interval={}s retries={}",
+        keepalive.time_duration().as_secs(),
+        keepalive.interval_duration().as_secs(),
+        keepalive.retry_count()
+    );
 
     let streamer = TcpStreamer {
         ip,
@@ -77,6 +77,7 @@ pub async fn new(
         stream_config,
         state: TcpStreamerState::Listening { listener },
         process_cache: ProcessCache::new(),
+        keepalive,
     };
 
     Ok(streamer)
@@ -168,9 +169,9 @@ impl StreamerTrait for TcpStreamer {
                 // the connection going instead of turning a best-effort socket
                 // option into a fatal handshake failure.
                 let keepalive = TcpKeepalive::new()
-                    .with_time(KEEPALIVE_TIME)
-                    .with_interval(KEEPALIVE_INTERVAL)
-                    .with_retries(KEEPALIVE_RETRIES);
+                    .with_time(self.keepalive.time_duration())
+                    .with_interval(self.keepalive.interval_duration())
+                    .with_retries(self.keepalive.retry_count());
                 if let Err(e) = SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
                     warn!(
                         "failed to enable TCP keepalive ({e}); continuing without it, \
