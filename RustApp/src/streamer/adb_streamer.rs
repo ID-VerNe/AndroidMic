@@ -4,7 +4,7 @@ use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::{
-    config::ConnectionMode,
+    config::{ConnectionMode, TcpKeepaliveConfig},
     streamer::{StreamerMsg, tcp_streamer},
 };
 
@@ -220,8 +220,13 @@ fn spawn_device_watch(port: u16, initially_present: bool) -> JoinHandle<()> {
     })
 }
 
-pub async fn new(port: u16, stream_config: AudioStream) -> Result<AdbStreamer, ConnectError> {
-    let tcp_streamer = tcp_streamer::new("127.0.0.1".parse().unwrap(), port, stream_config).await?;
+pub async fn new(
+    port: u16,
+    stream_config: AudioStream,
+    keepalive: TcpKeepaliveConfig,
+) -> Result<AdbStreamer, ConnectError> {
+    let tcp_streamer =
+        tcp_streamer::new("127.0.0.1".parse().unwrap(), port, stream_config, keepalive).await?;
     let port = tcp_streamer.port;
 
     let devices = get_connected_devices().await?;
