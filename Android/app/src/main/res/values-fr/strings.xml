@@ -15,6 +15,8 @@
     <string name="drawer_subtitle_other">Autre</string>
 
     <string name="drawerMode">Mode de connection</string>
+    <string name="auto_connect">Connexion automatique</string>
+    <string name="auto_connect_summary">Démarrer automatiquement le flux lorsqu\'un tunnel USB/ADB est disponible</string>
     <string name="audio_source">Source audio</string>
     <string name="drawerTheme">Thèmes</string>
     <string name="dynamic_color">Couleur dynamique</string>

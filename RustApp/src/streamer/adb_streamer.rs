@@ -27,6 +27,14 @@ const ADB_REVERSE_ATTEMPTS: u32 = 3;
 /// base delay between reverse proxy rebuild attempts
 const ADB_REVERSE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Android app package names. The debug build uses an `applicationIdSuffix`.
+const ANDROID_APP_PACKAGES: [&str; 2] = [
+    "io.github.teamclouday.AndroidMic",
+    "io.github.teamclouday.AndroidMic.debug",
+];
+/// Extra read by MainActivity to start the stream without a phone-side tap.
+const AUTO_CONNECT_EXTRA: &str = "io.github.teamclouday.androidMic.extra.AUTO_CONNECT";
+
 async fn get_connected_devices() -> Result<Vec<String>, ConnectError> {
     let mut cmd = Command::new("adb");
     cmd.arg("devices");
@@ -134,6 +142,44 @@ async fn rebuild_reverse_proxies(port: u16) -> Result<(), ConnectError> {
     Err(last_error.unwrap_or(ConnectError::NoAdbDevice))
 }
 
+/// Ask the phone app to come to the foreground and auto-connect. This is
+/// what removes the phone-side Connect tap when the app is not already open.
+/// Release package first, debug build as a fallback; a missing package or a
+/// MIUI background-launch block only produces a warning.
+async fn launch_android_app(device_id: &str) -> Result<(), ConnectError> {
+    let mut last_error = None;
+
+    for package in ANDROID_APP_PACKAGES {
+        let mut cmd = Command::new("adb");
+        cmd.arg("-s")
+            .arg(device_id)
+            .arg("shell")
+            .arg("am")
+            .arg("start")
+            .arg("-n")
+            .arg(format!(
+                "{}/io.github.teamclouday.androidMic.ui.MainActivity",
+                package
+            ))
+            .arg("--ez")
+            .arg(AUTO_CONNECT_EXTRA)
+            .arg("true");
+
+        match exec_cmd(cmd).await {
+            Ok(_) => {
+                info!("launched AndroidMic ({package}) on {device_id}");
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("can't launch AndroidMic ({package}) on {device_id}: {e}");
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or(ConnectError::NoAdbDevice))
+}
+
 /// Poll `adb devices` for the lifetime of the streamer. The watcher is a
 /// separate task so it never cancels the TCP accept/handshake path.
 fn spawn_device_watch(port: u16, initially_present: bool) -> JoinHandle<()> {
@@ -156,7 +202,14 @@ fn spawn_device_watch(port: u16, initially_present: bool) -> JoinHandle<()> {
             if now_present && !present {
                 info!("adb device attached: {devices:?}");
                 match rebuild_reverse_proxies(port).await {
-                    Ok(()) => present = true,
+                    Ok(()) => {
+                        present = true;
+                        for device_id in &devices {
+                            if let Err(e) = launch_android_app(device_id).await {
+                                warn!("can't auto-start AndroidMic on {device_id}: {e}");
+                            }
+                        }
+                    }
                     Err(e) => warn!("can't create adb reverse proxy: {e}"),
                 }
             } else if !now_present && present {
@@ -176,6 +229,11 @@ pub async fn new(port: u16, stream_config: AudioStream) -> Result<AdbStreamer, C
 
     if present {
         recreate_reverse_proxies(port).await?;
+        for device_id in &devices {
+            if let Err(e) = launch_android_app(device_id).await {
+                warn!("can't auto-start AndroidMic on {device_id}: {e}");
+            }
+        }
     } else {
         info!("no adb device at startup, waiting for one on port {port}");
     }

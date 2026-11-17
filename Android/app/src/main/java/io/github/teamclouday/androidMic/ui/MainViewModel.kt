@@ -1,5 +1,7 @@
 package io.github.teamclouday.androidMic.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -8,6 +10,7 @@ import android.os.Messenger
 import android.os.Process
 import android.util.Log
 import androidx.compose.runtime.mutableStateOf
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.teamclouday.androidMic.AndroidMicApp
@@ -20,14 +23,19 @@ import io.github.teamclouday.androidMic.Mode
 import io.github.teamclouday.androidMic.R
 import io.github.teamclouday.androidMic.SampleRates
 import io.github.teamclouday.androidMic.Themes
+import io.github.teamclouday.androidMic.domain.service.AutoConnectPolicy
 import io.github.teamclouday.androidMic.domain.service.Command
 import io.github.teamclouday.androidMic.domain.service.CommandData
 import io.github.teamclouday.androidMic.domain.service.ResponseData
 import io.github.teamclouday.androidMic.domain.service.ResponseKind
 import io.github.teamclouday.androidMic.ui.utils.UiHelper
 import io.github.teamclouday.androidMic.utils.Either
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 
 private const val TAG = "MainViewModel"
 
@@ -51,6 +59,12 @@ class MainViewModel : ViewModel() {
 
     val isMuted = mutableStateOf(false)
 
+    private var autoConnectJob: Job? = null
+    private var autoAttempt: CompletableDeferred<Boolean>? = null
+    private var autoConnectPausedLocal = false
+    private var pendingAutoConnect = false
+    private var explicitAutoConnectRequest = false
+
     init {
         Log.d(TAG, "init")
     }
@@ -65,6 +79,10 @@ class MainViewModel : ViewModel() {
                     data.isConnected?.let {
                         isButtonConnectClickable.value = true
                         isStreamStarted.value = it
+                        autoAttempt?.complete(it)
+                        if (!it && pendingAutoConnect) {
+                            maybeAutoConnect()
+                        }
                     }
 
                     data.isMuted?.let {
@@ -95,6 +113,10 @@ class MainViewModel : ViewModel() {
         isButtonConnectClickable.value = false
         isMuted.value = false
 
+        // decide once per bind whether this launch should try auto-connect;
+        // the actual trigger waits for the BindCheck response below
+        pendingAutoConnect = explicitAutoConnectRequest || canAutoConnectByPreferences()
+
         val msg = CommandData(Command.BindCheck).toCommandMsg()
         msg.replyTo = messenger
         service?.send(msg)
@@ -118,17 +140,28 @@ class MainViewModel : ViewModel() {
     fun onConnectButton(): Dialogs? {
         if (!isBound) return null
         isMuted.value = false
+
+        // A manual action always wins over a pending/in-flight auto attempt.
+        pendingAutoConnect = false
+        explicitAutoConnectRequest = false
+        cancelAutoConnect()
+
         val message = if (isStreamStarted.value) {
             Log.d(TAG, "onConnectButton: stop stream")
+            // suppress auto-connect until the user explicitly presses Connect
+            autoConnectPausedLocal = true
+            viewModelScope.launch { prefs.autoConnectPaused.update(true) }
             CommandData(Command.StopStream)
         } else {
+            Log.d(TAG, "onConnectButton: start stream")
+            autoConnectPausedLocal = false
+            viewModelScope.launch { prefs.autoConnectPaused.update(false) }
+
             val res = runBlocking {
                 CommandData.fromPref(prefs, Command.StartStream)
             }
-            val data = when (res) {
-                is Either.Left<CommandData> -> {
-                    res.value
-                }
+            when (res) {
+                is Either.Left<CommandData> -> res.value
 
                 is Either.Right<Dialogs> -> {
                     uiHelper.makeToast(
@@ -137,10 +170,6 @@ class MainViewModel : ViewModel() {
                     return res.value
                 }
             }
-
-            Log.d(TAG, "onConnectButton: start stream")
-
-            data
         }.toCommandMsg()
 
         // lock button to avoid duplicate events
@@ -150,6 +179,128 @@ class MainViewModel : ViewModel() {
         service?.send(message)
 
         return null
+    }
+
+    /**
+     * Trigger an auto-connect attempt. Repeated calls while one is running are
+     * ignored. Safe to call before the service is bound; it simply returns.
+     */
+    fun maybeAutoConnect() {
+        if (!pendingAutoConnect) return
+        if (autoConnectJob?.isActive == true) return
+        if (!isBound || isStreamStarted.value || !isButtonConnectClickable.value) return
+
+        autoConnectJob = viewModelScope.launch {
+            if (!shouldAutoConnect()) {
+                pendingAutoConnect = false
+                return@launch
+            }
+
+            for (attempt in 0 until AutoConnectPolicy.attemptCount) {
+                if (autoConnectPausedLocal || isStreamStarted.value) {
+                    pendingAutoConnect = false
+                    return@launch
+                }
+                if (attempt > 0) {
+                    delay(AutoConnectPolicy.delayFor(attempt))
+                }
+                if (!shouldAutoConnect()) {
+                    pendingAutoConnect = false
+                    return@launch
+                }
+
+                val result = attemptStartStream()
+                if (result) {
+                    pendingAutoConnect = false
+                    explicitAutoConnectRequest = false
+                    return@launch
+                }
+                Log.d(TAG, "auto connect attempt ${attempt + 1} failed")
+            }
+
+            Log.d(TAG, "auto connect gave up after ${AutoConnectPolicy.attemptCount} attempts")
+            pendingAutoConnect = false
+        }
+    }
+
+    /** Called by MainActivity when it receives an explicit auto-connect intent. */
+    fun requestAutoConnect() {
+        explicitAutoConnectRequest = true
+        pendingAutoConnect = true
+        maybeAutoConnect()
+    }
+
+    private suspend fun attemptStartStream(): Boolean {
+        if (!isBound) return false
+
+        val res = CommandData.fromPref(prefs, Command.StartStream)
+        if (res is Either.Right<Dialogs>) {
+            Log.d(TAG, "auto connect: invalid port, not starting")
+            return false
+        }
+        val data = (res as Either.Left<CommandData>).value
+
+        val deferred = CompletableDeferred<Boolean>()
+        autoAttempt = deferred
+
+        isMuted.value = false
+        isButtonConnectClickable.value = false
+        val message = data.toCommandMsg().apply { replyTo = messenger }
+        val target = service
+        if (target == null) {
+            autoAttempt = null
+            return false
+        }
+        try {
+            target.send(message)
+        } catch (e: Exception) {
+            Log.d(TAG, "auto connect: send failed: ${e.message}")
+            autoAttempt = null
+            return false
+        }
+
+        val connected = withTimeoutOrNull(AutoConnectPolicy.ATTEMPT_TIMEOUT_MS) {
+            deferred.await()
+        } ?: false
+
+        autoAttempt = null
+        return connected
+    }
+
+    private suspend fun shouldAutoConnect(): Boolean {
+        if (!isBound || isStreamStarted.value || !isButtonConnectClickable.value) return false
+        if (autoConnectPausedLocal) return false
+        if (!prefs.autoConnect.get()) return false
+        if (prefs.mode.get() != Mode.ADB) return false
+        if (prefs.autoConnectPaused.get()) return false
+        if (!hasRecordAudioPermission()) {
+            Log.d(TAG, "auto connect: RECORD_AUDIO not granted, skipping")
+            return false
+        }
+        return true
+    }
+
+    private fun canAutoConnectByPreferences(): Boolean {
+        if (autoConnectPausedLocal) return false
+        if (!prefs.autoConnect.getBlocking()) return false
+        if (prefs.mode.getBlocking() != Mode.ADB) return false
+        if (prefs.autoConnectPaused.getBlocking()) return false
+        return hasRecordAudioPermission()
+    }
+
+    private fun hasRecordAudioPermission(): Boolean {
+        val context = AndroidMicApp.appModule.context
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun cancelAutoConnect() {
+        autoConnectJob?.cancel()
+        autoConnectJob = null
+        autoAttempt?.cancel()
+        autoAttempt = null
     }
 
     fun setIpPort(ip: String, port: String) {
@@ -162,6 +313,31 @@ class MainViewModel : ViewModel() {
     fun setMode(mode: Mode) {
         viewModelScope.launch {
             prefs.mode.update(mode)
+            if (mode == Mode.ADB && prefs.autoConnect.get()) {
+                explicitAutoConnectRequest = true
+                pendingAutoConnect = true
+                maybeAutoConnect()
+            } else {
+                pendingAutoConnect = false
+                cancelAutoConnect()
+            }
+        }
+    }
+
+    fun setAutoConnect(enabled: Boolean) {
+        viewModelScope.launch {
+            prefs.autoConnect.update(enabled)
+            if (enabled) {
+                // turning the switch on is an explicit override of a manual pause
+                autoConnectPausedLocal = false
+                prefs.autoConnectPaused.update(false)
+                explicitAutoConnectRequest = true
+                pendingAutoConnect = true
+                maybeAutoConnect()
+            } else {
+                pendingAutoConnect = false
+                cancelAutoConnect()
+            }
         }
     }
 

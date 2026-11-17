@@ -23,6 +23,7 @@ class AndroidMicApp : Application() {
         lateinit var appModule: AppModule
         var service: Messenger? = null
         var isBound = false
+        private var isBinding = false
     }
 
     private val scope = MainScope()
@@ -39,6 +40,7 @@ class AndroidMicApp : Application() {
     private val mConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             Log.d(TAG, "onServiceConnected")
+            isBinding = false
             Companion.service = Messenger(service)
             isBound = true
             // notify current running activity that service is connected
@@ -59,16 +61,30 @@ class AndroidMicApp : Application() {
 
     // start and bind to service
     fun bindService() {
+        // onStart can run while the app is still considered background (for
+        // example when the PC launches it over adb with the screen off).
+        // startService throws there; binding alone is enough to reach the
+        // service, and MainActivity retries on resume.
+        if (isBound || isBinding) return
+
         val intent = Intent(this, ForegroundService::class.java).apply {
             action = BIND_SERVICE_ACTION
         }
-        startService(intent)
-        bindService(intent, mConnection, BIND_AUTO_CREATE)
+        isBinding = true
+        try {
+            startService(intent)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "startService not allowed in background: ${e.message}")
+        }
+        if (!bindService(intent, mConnection, BIND_AUTO_CREATE)) {
+            isBinding = false
+        }
     }
 
     fun unBindService() {
         unbindService(mConnection)
         service = null
         isBound = false
+        isBinding = false
     }
 }

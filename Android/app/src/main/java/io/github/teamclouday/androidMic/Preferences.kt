@@ -28,6 +28,11 @@ class AppPreferences(
     val ip = stringPreference("ip", "192.168.")
     val port = stringPreference("port", "")
 
+    // start streaming automatically when an ADB tunnel is available
+    val autoConnect = booleanPreference("autoConnect", false)
+    // set after an explicit user Disconnect; cleared by an explicit Connect
+    val autoConnectPaused = booleanPreference("autoConnectPaused", false)
+
 
     val theme = enumPreference("theme", Themes.System)
     val dynamicColor = booleanPreference("dynamicColor", true)

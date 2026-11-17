@@ -19,6 +19,7 @@ import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
@@ -98,6 +99,15 @@ fun DrawerBody(vm: MainViewModel) {
                 contentDescription = "set ip and port",
                 icon = Icons.Rounded.Wifi,
                 onClick = { dialogIpPortExpanded.value = true },
+            )
+        }
+
+        if (mode.value == Mode.ADB) {
+            SettingsSwitchItem(
+                title = stringResource(R.string.auto_connect),
+                subTitle = stringResource(R.string.auto_connect_summary),
+                checked = vm.prefs.autoConnect.getAsState().value,
+                onCheckedChange = { vm.setAutoConnect(it) },
             )
         }
 
@@ -199,6 +209,42 @@ private fun SettingsItemsSubtitle(
             text = stringResource(id = subtitle),
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onBackground
+        )
+    }
+    HorizontalDivider(color = MaterialTheme.colorScheme.onBackground)
+}
+
+
+@Composable
+private fun SettingsSwitchItem(
+    title: String,
+    subTitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+
+            Text(
+                text = subTitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange
         )
     }
     HorizontalDivider(color = MaterialTheme.colorScheme.onBackground)
