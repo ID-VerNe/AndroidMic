@@ -258,6 +258,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tray-icon",
+ "windows 0.62.2",
  "winres",
  "zconf",
 ]

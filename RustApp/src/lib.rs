@@ -3,6 +3,7 @@ extern crate log;
 
 pub mod audio;
 pub mod config;
+pub mod on_demand;
 pub mod single_instance;
 pub mod start_at_login;
 pub mod streamer;
