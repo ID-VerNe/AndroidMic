@@ -262,6 +262,28 @@ impl AppState {
         }
     }
 
+    /// Replay the latest on-demand watcher state onto the command channel.
+    /// Called once the streamer sender becomes available, so an update that
+    /// arrived before Ready (and would have been dropped by the ready guard)
+    /// still reaches the current streamer; the runner additionally caches and
+    /// replays this state onto the next Connect.
+    fn replay_capture_state(&mut self) {
+        match self.watcher_state {
+            WatcherState::Degraded => {
+                self.send_command(StreamerCommand::SetCaptureDegraded(true));
+            }
+            WatcherState::DemandOn => {
+                self.send_command(StreamerCommand::SetCaptureDegraded(false));
+                self.send_command(StreamerCommand::SetCaptureDemand(true));
+            }
+            WatcherState::DemandOff => {
+                self.send_command(StreamerCommand::SetCaptureDegraded(false));
+                self.send_command(StreamerCommand::SetCaptureDemand(false));
+            }
+            WatcherState::Unknown => {}
+        }
+    }
+
     /// Bring the UI back to the disconnected state after the streamer task is
     /// gone or its command channel broke.
     fn reset_stream_state(&mut self) {
@@ -785,8 +807,13 @@ impl Application for AppState {
                     // point of the feature is plugging the cable in without
                     // clicking Connect on the PC.
                     if config.auto_connect || is_adb_mode(config.connection_mode) {
+                        // Replay any watcher update that arrived before the
+                        // channel was ready; the runner re-caches and replays
+                        // it on Connect.
+                        self.replay_capture_state();
                         return self.connect();
                     }
+                    self.replay_capture_state();
                 }
                 StreamerMsg::CaptureLink(status) => {
                     self.capture_link = status;

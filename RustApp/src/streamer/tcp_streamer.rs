@@ -707,6 +707,41 @@ mod tests {
     }
 
     #[test]
+    fn replayed_degraded_seed_starts_always_on() {
+        // Runner replay onto a fresh channel after a pre-Connect one-shot
+        // Degraded: degraded=true wins over the stale cached demand=false, so
+        // the Hello advertises always-on even before any Control frame arrives.
+        let mut channel = CaptureChannel::new(true);
+        channel.set_degraded(true);
+        channel.set_demand(false);
+
+        assert!(channel.degraded);
+        assert!(channel.demand);
+        assert!(channel.effective_demand());
+    }
+
+    #[test]
+    fn replayed_recovered_seed_starts_off_then_follows_demand() {
+        // Runner replay after recovery: the fresh channel starts idle, and
+        // subsequent demand updates drive it on and off normally.
+        let mut channel = CaptureChannel::new(true);
+        channel.set_degraded(false);
+        channel.set_demand(false);
+
+        assert!(!channel.degraded);
+        assert!(!channel.demand);
+        assert!(!channel.effective_demand());
+
+        channel.state = CaptureLinkStatus::Linked;
+        channel.set_demand(true);
+        assert!(channel.effective_demand());
+        assert!(channel.demand_dirty);
+
+        channel.set_demand(false);
+        assert!(!channel.effective_demand());
+    }
+
+    #[test]
     fn rebind_delay_grows_then_caps() {
         let cases = [
             (0, 500),

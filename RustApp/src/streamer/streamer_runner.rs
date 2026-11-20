@@ -52,6 +52,37 @@ pub enum CaptureLinkStatus {
     Legacy,
 }
 
+/// Latest on-demand capture demand/degradation, cached in the runner.
+///
+/// A one-shot Degraded (source construction failure, non-Windows, spawn
+/// failure, panic) or a demand update can arrive before the first Connect,
+/// while the active streamer is the `DummyStreamer` (whose hooks are no-ops).
+/// The runner keeps the latest state here and replays it onto every fresh
+/// streamer so a new channel starts in the correct fail-open state instead of
+/// `degraded=false, demand=false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CaptureDemandState {
+    degraded: bool,
+    demand: bool,
+}
+
+impl CaptureDemandState {
+    fn record_demand(&mut self, enabled: bool) {
+        self.demand = enabled;
+    }
+
+    fn record_degraded(&mut self, degraded: bool) {
+        self.degraded = degraded;
+    }
+
+    /// Replay the cached state onto a fresh streamer: degradation first, so a
+    /// forced-on state wins, then the cached demand.
+    fn replay_on(&self, streamer: &mut impl StreamerTrait) {
+        streamer.set_capture_degraded(self.degraded);
+        streamer.set_capture_demand(self.demand);
+    }
+}
+
 /// App -> Streamer
 pub enum StreamerCommand {
     Connect {
@@ -146,6 +177,8 @@ pub fn sub() -> impl Stream<Item = StreamerMsg> {
         let (command_sender, mut command_receiver) = mpsc::channel(100);
 
         let mut streamer: Streamer = DummyStreamer::new();
+        // Latest on-demand state, retained across streamer swaps and reconnects.
+        let mut capture_state = CaptureDemandState::default();
 
         send(&mut sender, StreamerMsg::Ready(command_sender)).await;
 
@@ -222,9 +255,15 @@ pub fn sub() -> impl Stream<Item = StreamerMsg> {
                                     };
 
                                 match new_streamer {
-                                    Ok(new_streamer) => {
+                                    Ok(mut new_streamer) => {
                                         send(&mut sender, new_streamer.status()).await;
                                         drop(streamer);
+                                        // Replay the cached on-demand state onto the
+                                        // fresh streamer: a one-shot Degraded that
+                                        // arrived before this Connect (or while the
+                                        // streamer was a Dummy) must reach the new
+                                        // channel so its Hello advertises always-on.
+                                        capture_state.replay_on(&mut new_streamer);
                                         streamer = new_streamer;
                                     }
                                     Err(e) => {
@@ -251,9 +290,11 @@ pub fn sub() -> impl Stream<Item = StreamerMsg> {
                                 streamer.set_window_visible(visible);
                             }
                             StreamerCommand::SetCaptureDemand(enabled) => {
+                                capture_state.record_demand(enabled);
                                 streamer.set_capture_demand(enabled);
                             }
                             StreamerCommand::SetCaptureDegraded(degraded) => {
+                                capture_state.record_degraded(degraded);
                                 streamer.set_capture_degraded(degraded);
                             }
                         }
@@ -280,4 +321,79 @@ pub fn sub() -> impl Stream<Item = StreamerMsg> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal streamer double recording only the on-demand hooks; every other
+    /// trait method is unreachable in these unit tests.
+    struct FakeStreamer {
+        degraded: Option<bool>,
+        demand: Option<bool>,
+    }
+
+    impl StreamerTrait for FakeStreamer {
+        async fn next(&mut self) -> Result<Option<StreamerMsg>, ConnectError> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        fn reconfigure_stream(&mut self, _config: AudioStream) {}
+
+        fn set_window_visible(&mut self, _visible: bool) {}
+
+        fn status(&self) -> StreamerMsg {
+            unreachable!()
+        }
+
+        fn set_capture_demand(&mut self, enabled: bool) {
+            self.demand = Some(enabled);
+        }
+
+        fn set_capture_degraded(&mut self, degraded: bool) {
+            self.degraded = Some(degraded);
+        }
+    }
+
+    #[test]
+    fn cached_degraded_state_is_replayed_to_a_new_streamer() {
+        // One-shot Degraded before Connect (source failure / non-Windows / spawn
+        // failure / panic, watcher thread exits): the runner cached degraded=true
+        // with the stale cached demand=false, then replays onto the fresh streamer.
+        let mut state = CaptureDemandState::default();
+        state.record_degraded(true);
+        state.record_demand(false);
+
+        let mut fake = FakeStreamer {
+            degraded: None,
+            demand: None,
+        };
+        state.replay_on(&mut fake);
+
+        assert_eq!(fake.degraded, Some(true));
+        assert_eq!(fake.demand, Some(false));
+    }
+
+    #[test]
+    fn recovered_state_replays_off_and_still_follows_demand() {
+        // After recovery the cached state is degraded=false, demand=false; the
+        // fresh channel starts idle and later demand drives it normally.
+        let mut state = CaptureDemandState::default();
+        state.record_degraded(false);
+        state.record_demand(false);
+
+        let mut fake = FakeStreamer {
+            degraded: None,
+            demand: None,
+        };
+        state.replay_on(&mut fake);
+        assert_eq!(fake.degraded, Some(false));
+        assert_eq!(fake.demand, Some(false));
+
+        state.record_demand(true);
+        state.replay_on(&mut fake);
+        assert_eq!(fake.demand, Some(true));
+    }
 }
