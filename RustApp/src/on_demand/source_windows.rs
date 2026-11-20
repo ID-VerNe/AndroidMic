@@ -44,7 +44,10 @@ impl WindowsSessionSource {
                     .next()
                     .map(String::from)
                     .unwrap_or_else(|| description.name().to_owned());
-                let id = device.id().ok()?.to_string();
+                // `DeviceId::id()` returns the raw backend id; `to_string()`
+                // would render the `wasapi:` host prefix. Keep the raw id so
+                // it can be compared directly against the COM `GetId()` string.
+                let id = device.id().ok()?.id().to_owned();
                 Some((name, id))
             })
             .collect();
@@ -104,7 +107,7 @@ impl WindowsSessionSource {
                     .map_err(|_| WatcherError::EnumerationFailed)?;
                 let device_id = unsafe { device.GetId() }
                     .map_err(|_| WatcherError::EnumerationFailed)?;
-                if pwstr_to_string(device_id) == self.endpoint_id {
+                if endpoint_ids_match(&pwstr_to_string(device_id), &self.endpoint_id) {
                     matched = Some(device);
                     break;
                 }
@@ -164,6 +167,32 @@ impl SessionSource for WindowsSessionSource {
     }
 }
 
+/// Strip the cpal host prefix from a WASAPI device id.
+///
+/// cpal 0.18 `DeviceId::Display` renders `<host>:<id>` (e.g.
+/// `wasapi:{0.0.0....}.{guid}`), while the WASAPI backend stores the raw COM
+/// `GetId()` string and `IMMDevice::GetId()` returns the bare id. Normalize
+/// both sides before comparing so a prefixed and a bare id match.
+fn normalize_wasapi_id(id: &str) -> String {
+    let trimmed = id.trim();
+    if trimmed
+        .to_ascii_lowercase()
+        .strip_prefix("wasapi:")
+        .is_some()
+    {
+        trimmed["wasapi:".len()..].trim().to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Compare a COM `GetId()` string against a cpal device id, ignoring the
+/// optional `wasapi:` host prefix and surrounding whitespace. Friendly names
+/// are selected separately by [`select_endpoint`]; they never match an id here.
+fn endpoint_ids_match(com_id: &str, cpal_id: &str) -> bool {
+    normalize_wasapi_id(com_id) == normalize_wasapi_id(cpal_id)
+}
+
 /// Read a NUL-terminated wide string returned by a COM call into a lossy
 /// Rust `String`. The COM buffer is owned by the caller and leaked here:
 /// these ids are short and enumerated once per cached connection.
@@ -182,5 +211,42 @@ fn pwstr_to_string(p: windows::core::PWSTR) -> String {
             ptr = ptr.add(1);
         }
         String::from_utf16_lossy(&wide)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RAW_ID: &str = "{0.0.0.00000000}.{a498ec47-0ec5-4861-8819-338fba42d4ca}";
+
+    #[test]
+    fn prefixed_cpal_id_matches_bare_com_id() {
+        // cpal `DeviceId::to_string()` carries the `wasapi:` host prefix; the
+        // COM `GetId()` string is bare. The comparison must strip the prefix.
+        assert!(endpoint_ids_match(RAW_ID, &format!("wasapi:{RAW_ID}")));
+    }
+
+    #[test]
+    fn bare_ids_match_without_prefix() {
+        assert!(endpoint_ids_match(RAW_ID, RAW_ID));
+    }
+
+    #[test]
+    fn friendly_name_is_not_treated_as_an_endpoint_id() {
+        // Friendly-name selection is the `select_endpoint` substring path; a
+        // name must never falsely match a COM endpoint id.
+        assert!(!endpoint_ids_match(
+            RAW_ID,
+            "CABLE Output (VB-Audio Virtual Cable)"
+        ));
+    }
+
+    #[test]
+    fn normalization_trims_and_ignores_prefix_case() {
+        assert!(endpoint_ids_match(
+            &format!("  {RAW_ID}  "),
+            &format!("WASAPI:{RAW_ID}")
+        ));
     }
 }

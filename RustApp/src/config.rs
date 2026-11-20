@@ -575,4 +575,35 @@ endpoint_id = "Whisper Cable"
 
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn first_run_writes_default_on_demand_section_to_disk() {
+        // A brand-new config directory has no TOML yet. Persisting the loaded
+        // defaults once must write the `[on_demand_capture]` section
+        // (`enabled = true`, `endpoint_id = ""`) to disk; reloading the file
+        // keeps those defaults.
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "android_mic_config_firstrun_{}_{n}.toml",
+            std::process::id()
+        ));
+        assert!(!path.exists());
+
+        let mut manager: zconf::ConfigManager<Config> = zconf::ConfigManager::new(&path);
+        manager.update(|_| {});
+
+        let text = std::fs::read_to_string(&path).expect("first-run config written");
+        assert!(text.contains("[on_demand_capture]"));
+        assert!(text.contains("enabled = true"));
+        assert!(text.contains("endpoint_id = \"\""));
+
+        let reloaded: zconf::ConfigManager<Config> = zconf::ConfigManager::new(&path);
+        assert!(reloaded.data().on_demand_capture.enabled);
+        assert!(reloaded.data().on_demand_capture.endpoint_id.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
 }

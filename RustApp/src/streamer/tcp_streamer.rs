@@ -131,6 +131,16 @@ impl CaptureChannel {
         self.state = CaptureLinkStatus::Legacy;
         self.ack_deadline = None;
     }
+
+    /// Whether the absolute ack deadline recorded when the Hello was sent has
+    /// elapsed. The deadline is measured from the Hello, not from the last
+    /// received frame: continuous audio packets must not push it back.
+    fn ack_deadline_elapsed(&self, now: Instant) -> bool {
+        match self.ack_deadline {
+            Some(deadline) => now >= deadline,
+            None => false,
+        }
+    }
 }
 
 /// Whether an ack matches the negotiated protocol version and nonce. A mismatch
@@ -358,23 +368,40 @@ impl StreamerTrait for TcpStreamer {
                     }
                 }
 
-                // While negotiating, race the read against the ack timeout: a
-                // legacy peer that never answers degrades to always-on rather
-                // than blocking the read loop forever.
+                // While negotiating, race the read against the absolute ack
+                // deadline recorded when the Hello was sent. The deadline is
+                // not refreshed by incoming audio frames: a legacy peer that
+                // streams audio but never answers still degrades to always-on
+                // after ACK_TIMEOUT instead of staying Negotiating forever.
                 let frame_result = if self.capture.state == CaptureLinkStatus::Negotiating
                 {
-                    match tokio::time::timeout(ACK_TIMEOUT, framed.next()).await {
-                        Ok(inner) => inner,
-                        Err(_) => {
-                            info!(
-                                "no CaptureHelloAck within {ACK_TIMEOUT:?}; \
-                                 legacy phone, fail-open always-on"
-                            );
-                            self.capture.ack_timed_out();
-                            return Ok(Some(StreamerMsg::CaptureLink(
-                                CaptureLinkStatus::Legacy,
-                            )));
+                    match self.capture.ack_deadline {
+                        Some(deadline) => {
+                            if Instant::now() >= deadline {
+                                info!(
+                                    "no CaptureHelloAck within {ACK_TIMEOUT:?} of the Hello; \
+                                     legacy phone, fail-open always-on"
+                                );
+                                self.capture.ack_timed_out();
+                                return Ok(Some(StreamerMsg::CaptureLink(
+                                    CaptureLinkStatus::Legacy,
+                                )));
+                            }
+                            match tokio::time::timeout_at(deadline.into(), framed.next()).await {
+                                Ok(inner) => inner,
+                                Err(_) => {
+                                    info!(
+                                        "no CaptureHelloAck within {ACK_TIMEOUT:?} of the Hello; \
+                                         legacy phone, fail-open always-on"
+                                    );
+                                    self.capture.ack_timed_out();
+                                    return Ok(Some(StreamerMsg::CaptureLink(
+                                        CaptureLinkStatus::Legacy,
+                                    )));
+                                }
+                            }
                         }
+                        None => framed.next().await,
                     }
                 } else {
                     framed.next().await
@@ -619,6 +646,22 @@ mod tests {
         assert!(channel.ack_deadline.is_none());
         // Cached demand survives, but must not produce a control frame.
         assert!(!channel.demand_dirty);
+    }
+
+    #[test]
+    fn ack_deadline_is_absolute_and_not_refreshed_by_incoming_frames() {
+        // The deadline is stamped when the Hello is sent. Continuous audio
+        // frames arriving during negotiation must not push it back: once the
+        // absolute instant passes, the channel reports timed out regardless of
+        // how many frames were consumed in between.
+        let mut channel = CaptureChannel::new(true);
+        let now = Instant::now();
+        channel.ack_deadline = Some(now + ACK_TIMEOUT);
+
+        assert!(!channel.ack_deadline_elapsed(now));
+        assert!(!channel.ack_deadline_elapsed(now + ACK_TIMEOUT / 2));
+        assert!(channel.ack_deadline_elapsed(now + ACK_TIMEOUT));
+        assert!(channel.ack_deadline_elapsed(now + ACK_TIMEOUT + Duration::from_millis(1)));
     }
 
     #[test]

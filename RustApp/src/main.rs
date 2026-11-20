@@ -91,6 +91,7 @@ fn main() {
     std::fs::create_dir_all(config_path).expect("Failed to create config directory");
     let config_file_path = config_path.join(format!("{APP}.toml"));
 
+    let config_existed = config_file_path.exists();
     let mut config: ConfigManager<Config> = ConfigManager::new(config_file_path.clone());
 
     let args = Args::parse();
@@ -119,6 +120,14 @@ fn main() {
             config.sample_rate = sample_rate;
         }
     });
+
+    // First run: persist the in-memory defaults so shipped sections such as
+    // `[on_demand_capture]` land on disk even without a settings change. A
+    // pre-existing (possibly broken) TOML is left untouched: it falls back to
+    // defaults in memory only, matching the existing bad-config behaviour.
+    if !config_existed {
+        config.update(|_| {});
+    }
 
     localize::localize();
 

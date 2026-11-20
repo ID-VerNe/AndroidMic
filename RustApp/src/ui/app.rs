@@ -161,6 +161,42 @@ fn is_adb_mode(mode: ConnectionMode) -> bool {
     }
 }
 
+/// Pure four-state resolution for the main window.
+///
+/// Priority: a legacy peer (no matching Hello ack) outranks the local Degraded
+/// state — "旧版不支持" is a protocol incompatibility and must stay visible
+/// even when the local probe source is also degraded. Degraded is reserved for
+/// local probe-source problems on a supported transport; UDP/USB have no
+/// control channel and fall back to the degraded always-on UI.
+fn resolve_on_demand_view(
+    enabled: bool,
+    transport_supported: bool,
+    capture_link: CaptureLinkStatus,
+    watcher_state: WatcherState,
+) -> Option<OnDemandView> {
+    if !enabled {
+        return None;
+    }
+    if !transport_supported {
+        return Some(OnDemandView::Degraded);
+    }
+
+    match capture_link {
+        CaptureLinkStatus::Legacy => Some(OnDemandView::Legacy),
+        CaptureLinkStatus::Linked => match watcher_state {
+            WatcherState::DemandOn => Some(OnDemandView::Capturing),
+            WatcherState::Degraded => Some(OnDemandView::Degraded),
+            _ => Some(OnDemandView::Standby),
+        },
+        CaptureLinkStatus::Inactive | CaptureLinkStatus::Negotiating => {
+            match watcher_state {
+                WatcherState::Degraded => Some(OnDemandView::Degraded),
+                _ => Some(OnDemandView::Standby),
+            }
+        }
+    }
+}
+
 fn tray_menu_state(state: ConnectionState) -> TrayMenuState {
     match state {
         ConnectionState::Default => TrayMenuState {
@@ -448,28 +484,14 @@ impl AppState {
     /// Derived four-state on-demand view for the main window. `None` means the
     /// feature is disabled and the legacy always-on UI applies.
     pub fn on_demand_view(&self) -> Option<OnDemandView> {
-        if !self.config.data().on_demand_capture.enabled {
-            return None;
-        }
-
         let mode = self.config.data().connection_mode;
         let transport_supported = mode == ConnectionMode::Tcp || is_adb_mode(mode);
-        if !transport_supported || self.watcher_state == WatcherState::Degraded {
-            // UDP/USB have no control channel, and a failed watcher both fall
-            // back to the legacy always-on behaviour.
-            return Some(OnDemandView::Degraded);
-        }
-
-        match self.capture_link {
-            CaptureLinkStatus::Legacy => Some(OnDemandView::Legacy),
-            CaptureLinkStatus::Linked => match self.watcher_state {
-                WatcherState::DemandOn => Some(OnDemandView::Capturing),
-                _ => Some(OnDemandView::Standby),
-            },
-            CaptureLinkStatus::Inactive | CaptureLinkStatus::Negotiating => {
-                Some(OnDemandView::Standby)
-            }
-        }
+        resolve_on_demand_view(
+            self.config.data().on_demand_capture.enabled,
+            transport_supported,
+            self.capture_link,
+            self.watcher_state,
+        )
     }
 
     fn open_main_window(&mut self) -> Task<AppMsg> {
@@ -1327,6 +1349,114 @@ mod tray_menu_state_tests {
             assert_eq!(menu.stop_enabled, stop_enabled);
             assert_eq!(menu.action, action);
         }
+    }
+}
+
+#[cfg(test)]
+mod on_demand_view_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_peer_outranks_local_degraded() {
+        // A release/legacy phone that never answers the Hello shows "旧版不
+        // 支持" even when the local watcher is degraded too.
+        assert_eq!(
+            resolve_on_demand_view(
+                true,
+                true,
+                CaptureLinkStatus::Legacy,
+                WatcherState::Degraded
+            ),
+            Some(OnDemandView::Legacy)
+        );
+        assert_eq!(
+            resolve_on_demand_view(
+                true,
+                true,
+                CaptureLinkStatus::Legacy,
+                WatcherState::DemandOff
+            ),
+            Some(OnDemandView::Legacy)
+        );
+    }
+
+    #[test]
+    fn degraded_is_local_only_on_supported_transport() {
+        assert_eq!(
+            resolve_on_demand_view(
+                true,
+                true,
+                CaptureLinkStatus::Linked,
+                WatcherState::Degraded
+            ),
+            Some(OnDemandView::Degraded)
+        );
+        assert_eq!(
+            resolve_on_demand_view(
+                true,
+                true,
+                CaptureLinkStatus::Negotiating,
+                WatcherState::Degraded
+            ),
+            Some(OnDemandView::Degraded)
+        );
+    }
+
+    #[test]
+    fn linked_state_follows_watcher_demand() {
+        assert_eq!(
+            resolve_on_demand_view(
+                true,
+                true,
+                CaptureLinkStatus::Linked,
+                WatcherState::DemandOn
+            ),
+            Some(OnDemandView::Capturing)
+        );
+        assert_eq!(
+            resolve_on_demand_view(
+                true,
+                true,
+                CaptureLinkStatus::Linked,
+                WatcherState::DemandOff
+            ),
+            Some(OnDemandView::Standby)
+        );
+        assert_eq!(
+            resolve_on_demand_view(
+                true,
+                true,
+                CaptureLinkStatus::Negotiating,
+                WatcherState::Unknown
+            ),
+            Some(OnDemandView::Standby)
+        );
+    }
+
+    #[test]
+    fn unsupported_transport_falls_back_to_degraded_ui() {
+        assert_eq!(
+            resolve_on_demand_view(
+                true,
+                false,
+                CaptureLinkStatus::Inactive,
+                WatcherState::Unknown
+            ),
+            Some(OnDemandView::Degraded)
+        );
+    }
+
+    #[test]
+    fn disabled_feature_has_no_on_demand_view() {
+        assert_eq!(
+            resolve_on_demand_view(
+                false,
+                true,
+                CaptureLinkStatus::Linked,
+                WatcherState::DemandOn
+            ),
+            None
+        );
     }
 }
 
