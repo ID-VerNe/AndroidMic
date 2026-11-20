@@ -22,6 +22,7 @@ pub enum ConnectOption {
         ip: IpAddr,
         port: u16,
         keepalive: TcpKeepaliveConfig,
+        on_demand_enabled: bool,
     },
     Udp {
         ip: IpAddr,
@@ -31,9 +32,24 @@ pub enum ConnectOption {
     Adb {
         port: u16,
         keepalive: TcpKeepaliveConfig,
+        on_demand_enabled: bool,
     },
     #[cfg(feature = "usb")]
     Usb,
+}
+
+/// On-demand capture negotiation state reported by the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureLinkStatus {
+    /// Feature disabled, or a transport that cannot carry the control channel:
+    /// no `CaptureHello` is sent.
+    Inactive,
+    /// `CaptureHello` sent, awaiting a matching `CaptureHelloAck`.
+    Negotiating,
+    /// Ack matched the nonce: on-demand capture is linked.
+    Linked,
+    /// No matching ack within the timeout: legacy phone, stay always-on.
+    Legacy,
 }
 
 /// App -> Streamer
@@ -50,6 +66,9 @@ pub enum StreamerCommand {
         is_window_visible: bool,
     },
     SetWindowVisible(bool),
+    /// Debounced on-demand demand from the PC session watcher. Only honoured
+    /// once the control channel is linked; otherwise ignored (fail-open).
+    SetCaptureDemand(bool),
     Stop,
 }
 
@@ -78,6 +97,7 @@ impl Debug for StreamerCommand {
                 .finish(),
             Self::Stop => write!(f, "Stop"),
             Self::SetWindowVisible(visible) => write!(f, "SetWindowVisible({visible})"),
+            Self::SetCaptureDemand(enabled) => write!(f, "SetCaptureDemand({enabled})"),
         }
     }
 }
@@ -99,6 +119,8 @@ pub enum StreamerMsg {
         mode: ConnectionMode,
     },
     Ready(Sender<StreamerCommand>),
+    /// On-demand capture negotiation result for the current connection.
+    CaptureLink(CaptureLinkStatus),
 }
 
 impl StreamerMsg {
@@ -158,15 +180,27 @@ pub fn sub() -> impl Stream<Item = StreamerMsg> {
                                             ip,
                                             port,
                                             keepalive,
-                                        } => tcp_streamer::new(ip, port, stream_config, keepalive)
-                                            .await
-                                            .map(Streamer::from),
+                                            on_demand_enabled,
+                                        } => tcp_streamer::new(
+                                            ip,
+                                            port,
+                                            stream_config,
+                                            keepalive,
+                                            on_demand_enabled,
+                                        )
+                                        .await
+                                        .map(Streamer::from),
                                         #[cfg(feature = "adb")]
-                                        ConnectOption::Adb { port, keepalive } => {
+                                        ConnectOption::Adb {
+                                            port,
+                                            keepalive,
+                                            on_demand_enabled,
+                                        } => {
                                             crate::streamer::adb_streamer::new(
                                                 port,
                                                 stream_config,
                                                 keepalive,
+                                                on_demand_enabled,
                                             )
                                             .await
                                             .map(Streamer::from)
@@ -212,6 +246,9 @@ pub fn sub() -> impl Stream<Item = StreamerMsg> {
                             }
                             StreamerCommand::SetWindowVisible(visible) => {
                                 streamer.set_window_visible(visible);
+                            }
+                            StreamerCommand::SetCaptureDemand(enabled) => {
+                                streamer.set_capture_demand(enabled);
                             }
                         }
                     }

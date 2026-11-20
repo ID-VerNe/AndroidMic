@@ -188,7 +188,13 @@ impl StreamerTrait for UdpStreamer {
                                         Ok(message)
                                     }
                                 }
-                                None => todo!(),
+                                None => {
+                                    // Unknown oneof payload: ignore the frame
+                                    // instead of panicking. UDP never carries the
+                                    // on-demand control channel.
+                                    warn!("dropping UDP frame with unknown message payload");
+                                    Ok(None)
+                                }
                             }
                         }
                         Err(e) => Err(ConnectError::WriteError(WriteError::Deserializer(e))),
@@ -203,7 +209,14 @@ impl StreamerTrait for UdpStreamer {
                     }
                 }
                 None => {
-                    todo!()
+                    // UDP socket closed/ended: reset to listening instead of
+                    // panicking on the unknown stream end.
+                    self.is_listening = true;
+                    self.next_sequence = None;
+                    Ok(Some(StreamerMsg::Listening {
+                        ip: Some(self.ip),
+                        port: Some(self.port),
+                    }))
                 }
             },
             Err(_) => {

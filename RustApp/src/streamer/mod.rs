@@ -25,7 +25,9 @@ mod usb_streamer;
 use crate::streamer::usb_streamer::UsbStreamer;
 
 pub use message::AudioPacketMessage;
-pub use streamer_runner::{ConnectOption, StreamerCommand, StreamerMsg, sub};
+pub use streamer_runner::{
+    CaptureLinkStatus, ConnectOption, StreamerCommand, StreamerMsg, sub,
+};
 
 use crate::{
     audio::{AudioProcessParams, playout::PlayoutWriter},
@@ -82,6 +84,10 @@ trait StreamerTrait {
     fn set_window_visible(&mut self, visible: bool);
 
     fn status(&self) -> StreamerMsg;
+
+    /// Apply a debounced on-demand demand update. Transports without a control
+    /// channel (UDP/USB) ignore this by default; the demand stays always-on.
+    fn set_capture_demand(&mut self, _enabled: bool) {}
 }
 #[allow(clippy::enum_variant_names)]
 #[enum_dispatch(StreamerTrait)]
@@ -167,6 +173,41 @@ impl StreamerTrait for DummyStreamer {
 
     fn status(&self) -> StreamerMsg {
         unreachable!()
+    }
+}
+
+#[cfg(test)]
+mod transport_isolation_tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn streamer_source(name: &str) -> String {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("streamer");
+        fs::read_to_string(root.join(name)).expect("streamer source readable")
+    }
+
+    #[test]
+    fn udp_and_usb_never_reference_capture_protocol() {
+        // The on-demand control channel exists only on TCP/ADB. UDP and USB
+        // must neither construct nor send any Capture envelope, and must not
+        // override the no-op demand hook.
+        for name in ["udp_streamer.rs", "usb_streamer.rs"] {
+            let text = streamer_source(name);
+            for banned in [
+                "CaptureEnvelope",
+                "CaptureHello",
+                "CaptureControl",
+                "CaptureHelloAck",
+                "set_capture_demand",
+            ] {
+                assert!(
+                    !text.contains(banned),
+                    "{name} must not reference {banned}"
+                );
+            }
+        }
     }
 }
 

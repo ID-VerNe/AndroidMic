@@ -1,10 +1,10 @@
 use std::{
     io,
     net::{IpAddr, SocketAddr},
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use prost::Message;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::{
@@ -16,12 +16,26 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use crate::{
     audio::process::ProcessCache,
     config::{ConnectionMode, TcpKeepaliveConfig},
-    streamer::{CHECK_1, CHECK_2, StreamerMsg, WriteError},
+    streamer::{
+        CaptureLinkStatus, CHECK_1, CHECK_2, StreamerMsg, WriteError,
+        message::{
+            CaptureControl, CaptureEnvelope, CaptureHello, CaptureHelloAck,
+            capture_envelope::Payload,
+        },
+    },
 };
 
 use super::{AudioPacketMessage, AudioStream, ConnectError, StreamerTrait};
 
 const MAX_WAIT_TIME: Duration = Duration::from_millis(1500);
+
+/// On-demand capture protocol version spoken by this PC build.
+const CAPTURE_PROTOCOL_VERSION: u32 = 1;
+/// Capability bit0: on-demand capture.
+const CAPTURE_CAPABILITIES_ON_DEMAND: u32 = 1;
+/// How long the PC waits for a matching `CaptureHelloAck` before treating the
+/// peer as a legacy always-on phone.
+const ACK_TIMEOUT: Duration = Duration::from_millis(800);
 
 const DISCONNECT_LOOP_DETECTER_MAX: u32 = 1000;
 
@@ -41,6 +55,60 @@ pub struct TcpStreamer {
     stream_config: AudioStream,
     process_cache: ProcessCache,
     keepalive: TcpKeepaliveConfig,
+    capture: CaptureChannel,
+}
+
+/// On-demand capture negotiation/control state carried on the TCP (or ADB-over
+/// TCP) connection. UDP/USB transports never own one: the control channel
+/// exists only here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptureChannel {
+    enabled: bool,
+    state: CaptureLinkStatus,
+    nonce: u32,
+    ack_deadline: Option<Instant>,
+    /// Latest debounced demand from the PC watcher.
+    demand: bool,
+    /// Demand changed while linked and still needs to be flushed to the peer.
+    demand_dirty: bool,
+}
+
+impl CaptureChannel {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            state: CaptureLinkStatus::Inactive,
+            nonce: 0,
+            ack_deadline: None,
+            demand: false,
+            demand_dirty: false,
+        }
+    }
+
+    /// Record a debounced demand change. Only a linked channel marks the demand
+    /// dirty so it can be flushed; before the ack arrives or on a legacy peer
+    /// the demand is cached but never sent (fail-open).
+    fn set_demand(&mut self, enabled: bool) {
+        let changed = self.demand != enabled;
+        self.demand = enabled;
+
+        if changed && self.state == CaptureLinkStatus::Linked {
+            self.demand_dirty = true;
+        }
+    }
+
+    /// Ack did not arrive within the timeout: treat the peer as legacy and stay
+    /// always-on. The cached demand is kept, but no control frame is sent.
+    fn ack_timed_out(&mut self) {
+        self.state = CaptureLinkStatus::Legacy;
+        self.ack_deadline = None;
+    }
+}
+
+/// Whether an ack matches the negotiated protocol version and nonce. A mismatch
+/// means the peer is legacy; the read loop falls back to always-on.
+fn ack_matches(ack: &CaptureHelloAck, nonce: u32) -> bool {
+    ack.protocol_version == CAPTURE_PROTOCOL_VERSION && ack.nonce == nonce
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -59,6 +127,7 @@ pub async fn new(
     port: u16,
     stream_config: AudioStream,
     keepalive: TcpKeepaliveConfig,
+    on_demand_enabled: bool,
 ) -> Result<TcpStreamer, ConnectError> {
     let listener = bind_reusable(ip, port).await?;
 
@@ -78,6 +147,7 @@ pub async fn new(
         state: TcpStreamerState::Listening { listener },
         process_cache: ProcessCache::new(),
         keepalive,
+        capture: CaptureChannel::new(on_demand_enabled),
     };
 
     Ok(streamer)
@@ -107,6 +177,10 @@ impl StreamerTrait for TcpStreamer {
     fn reconfigure_stream(&mut self, stream_config: AudioStream) {
         self.stream_config = stream_config;
         self.process_cache.clear();
+    }
+
+    fn set_capture_demand(&mut self, enabled: bool) {
+        self.capture.set_demand(enabled);
     }
 
     fn set_window_visible(&mut self, visible: bool) {
@@ -181,8 +255,42 @@ impl StreamerTrait for TcpStreamer {
 
                 info!("connection accepted, remote address: {}", addr);
 
+                let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+
+                // On-demand handshake: only the TCP/ADB control channel sends
+                // Capture messages. If the feature is off we stay silent here
+                // and behave exactly like the legacy build.
+                if self.capture.enabled {
+                    self.capture.nonce = new_nonce();
+                    self.capture.state = CaptureLinkStatus::Negotiating;
+                    self.capture.ack_deadline = Some(Instant::now() + ACK_TIMEOUT);
+
+                    let hello = CaptureHello {
+                        protocol_version: CAPTURE_PROTOCOL_VERSION,
+                        capabilities: CAPTURE_CAPABILITIES_ON_DEMAND,
+                        nonce: self.capture.nonce,
+                        capture_enabled: self.capture.demand,
+                    };
+                    let envelope = CaptureEnvelope {
+                        payload: Some(Payload::Hello(hello)),
+                    };
+
+                    let payload = prost::bytes::Bytes::from(envelope.encode_to_vec());
+                    if let Err(e) = framed.send(payload).await {
+                        // Fail open: a hello write failure must not kill the audio
+                        // connection; the peer simply stays on always-on capture.
+                        warn!("failed to send CaptureHello: {e}; staying always-on");
+                        self.capture.state = CaptureLinkStatus::Legacy;
+                    } else {
+                        info!(
+                            "CaptureHello sent (nonce={}), awaiting ack within {:?}",
+                            self.capture.nonce, ACK_TIMEOUT
+                        );
+                    }
+                }
+
                 self.state = TcpStreamerState::Streaming {
-                    framed: Framed::new(stream, LengthDelimitedCodec::new()),
+                    framed,
                     disconnect_loop_detecter: 0,
                 };
 
@@ -195,38 +303,119 @@ impl StreamerTrait for TcpStreamer {
             TcpStreamerState::Streaming {
                 framed,
                 disconnect_loop_detecter: _,
-            } => match framed.next().await {
-                Some(Ok(frame)) => match AudioPacketMessage::decode(frame) {
-                    Ok(packet) => {
-                        let buffer_size = packet.buffer.len();
-                        let sample_rate = packet.sample_rate;
+            } => {
+                // Flush a debounced demand change once the control channel is
+                // linked. Control frames are only ever written here, on TCP.
+                if self.capture.demand_dirty
+                    && self.capture.state == CaptureLinkStatus::Linked
+                {
+                    self.capture.demand_dirty = false;
+                    let control = CaptureControl {
+                        enabled: self.capture.demand,
+                    };
+                    let envelope = CaptureEnvelope {
+                        payload: Some(Payload::Control(control)),
+                    };
+                    let payload = prost::bytes::Bytes::from(envelope.encode_to_vec());
+                    if let Err(e) = framed.send(payload).await {
+                        // Fail open: a control write failure keeps the previous
+                        // capture state instead of dropping the connection.
+                        warn!("failed to send CaptureControl: {e}; keeping previous state");
+                    } else {
+                        debug!("CaptureControl enabled={}", self.capture.demand);
+                    }
+                }
 
-                        match self
-                            .stream_config
-                            .process_audio_packet(packet, &mut self.process_cache)
-                        {
-                            Ok(Some(buffer)) => {
-                                debug!("received {} bytes", buffer_size);
-                                Outcome::Msg(Some(StreamerMsg::UpdateAudioWave {
-                                    data: AudioPacketMessage::to_wave_data(&buffer, sample_rate),
-                                }))
-                            }
-                            _ => Outcome::Msg(None),
+                // While negotiating, race the read against the ack timeout: a
+                // legacy peer that never answers degrades to always-on rather
+                // than blocking the read loop forever.
+                let frame_result = if self.capture.state == CaptureLinkStatus::Negotiating
+                {
+                    match tokio::time::timeout(ACK_TIMEOUT, framed.next()).await {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            info!(
+                                "no CaptureHelloAck within {ACK_TIMEOUT:?}; \
+                                 legacy phone, fail-open always-on"
+                            );
+                            self.capture.ack_timed_out();
+                            return Ok(Some(StreamerMsg::CaptureLink(
+                                CaptureLinkStatus::Legacy,
+                            )));
                         }
                     }
-                    Err(e) => Outcome::Fatal(ConnectError::WriteError(WriteError::Deserializer(e))),
-                },
+                } else {
+                    framed.next().await
+                };
 
-                Some(Err(e)) => match e.kind() {
-                    io::ErrorKind::TimedOut => Outcome::Msg(None), // timeout use to check for input on stdin
-                    io::ErrorKind::WouldBlock => Outcome::Msg(None), // trigger on Linux when there is no stream input
-                    _ => {
-                        warn!("stream error: {e}, going back to listening");
-                        Outcome::Drop
+                match frame_result {
+                    Some(Ok(frame)) => {
+                        // Classify the ack before treating the frame as audio, but
+                        // only while still negotiating. A non-matching ack falls
+                        // through to the audio decoder below.
+                        if self.capture.state == CaptureLinkStatus::Negotiating
+                            && let Ok(ack) = CaptureHelloAck::decode(&frame[..])
+                        {
+                            if ack_matches(&ack, self.capture.nonce) {
+                                info!(
+                                    "CaptureHelloAck matched (nonce={}), on-demand linked",
+                                    ack.nonce
+                                );
+                                self.capture.state = CaptureLinkStatus::Linked;
+                                self.capture.ack_deadline = None;
+                                // Re-emit the current demand now that the
+                                // control channel is live.
+                                self.capture.demand_dirty = true;
+                                return Ok(Some(StreamerMsg::CaptureLink(
+                                    CaptureLinkStatus::Linked,
+                                )));
+                            }
+                            warn!(
+                                "CaptureHelloAck nonce/version mismatch (got {}, expected {}); \
+                                 legacy, fail-open",
+                                ack.nonce, self.capture.nonce
+                            );
+                            self.capture.state = CaptureLinkStatus::Legacy;
+                        }
+
+                        match AudioPacketMessage::decode(&frame[..]) {
+                            Ok(packet) => {
+                                let buffer_size = packet.buffer.len();
+                                let sample_rate = packet.sample_rate;
+
+                                match self
+                                    .stream_config
+                                    .process_audio_packet(packet, &mut self.process_cache)
+                                {
+                                    Ok(Some(buffer)) => {
+                                        debug!("received {} bytes", buffer_size);
+                                        Outcome::Msg(Some(StreamerMsg::UpdateAudioWave {
+                                            data: AudioPacketMessage::to_wave_data(
+                                                &buffer,
+                                                sample_rate,
+                                            ),
+                                        }))
+                                    }
+                                    _ => Outcome::Msg(None),
+                                }
+                            }
+                            Err(e) => Outcome::Fatal(ConnectError::WriteError(
+                                WriteError::Deserializer(e),
+                            )),
+                        }
                     }
-                },
-                None => Outcome::Drop,
-            },
+
+                    Some(Err(e)) => match e.kind() {
+                        io::ErrorKind::TimedOut => Outcome::Msg(None), // timeout use to check for input on stdin
+                        io::ErrorKind::WouldBlock => Outcome::Msg(None), // trigger on Linux when there is no stream input
+                        _ => {
+                            warn!("stream error: {e}, going back to listening");
+                            Outcome::Drop
+                        }
+                    },
+                    None => Outcome::Drop,
+                }
+            }
         };
 
         match outcome {
@@ -288,6 +477,15 @@ impl TcpStreamer {
     }
 }
 
+/// Generate a fresh handshake nonce. `rand` is a dev-dependency only, so seed
+/// from the wall clock; the nonce only needs to be unique per connection.
+fn new_nonce() -> u32 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    elapsed.as_secs() as u32 ^ elapsed.subsec_nanos()
+}
+
 /// Exponential backoff between rebind attempts: 500ms, 1s, 2s, 4s, capped at 5s.
 fn rebind_delay(attempt: u32) -> Duration {
     let mut delay = REBIND_INITIAL_DELAY;
@@ -310,6 +508,86 @@ enum Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ack_timeout_is_800ms() {
+        // The PC waits 800ms for a matching ack; anything slower is treated as
+        // a legacy peer and fails open to always-on capture.
+        assert_eq!(ACK_TIMEOUT, Duration::from_millis(800));
+    }
+
+    #[test]
+    fn ack_matches_version_and_nonce() {
+        let ack = CaptureHelloAck {
+            protocol_version: CAPTURE_PROTOCOL_VERSION,
+            capabilities: CAPTURE_CAPABILITIES_ON_DEMAND,
+            nonce: 42,
+        };
+
+        assert!(ack_matches(&ack, 42));
+        // Wrong nonce: a stale/echoed ack must not link the channel.
+        assert!(!ack_matches(&ack, 43));
+
+        let wrong_version = CaptureHelloAck {
+            protocol_version: 9,
+            capabilities: CAPTURE_CAPABILITIES_ON_DEMAND,
+            nonce: 42,
+        };
+        assert!(!ack_matches(&wrong_version, 42));
+    }
+
+    #[test]
+    fn disabled_channel_stays_inactive_and_ignores_demand() {
+        let mut channel = CaptureChannel::new(false);
+        assert_eq!(channel.state, CaptureLinkStatus::Inactive);
+
+        channel.set_demand(true);
+        // A disabled feature never marks a control frame dirty.
+        assert!(!channel.demand_dirty);
+    }
+
+    #[test]
+    fn demand_before_link_is_not_flushed() {
+        let mut channel = CaptureChannel::new(true);
+        channel.state = CaptureLinkStatus::Negotiating;
+
+        channel.set_demand(true);
+        assert!(!channel.demand_dirty);
+    }
+
+    #[test]
+    fn ack_timeout_falls_back_to_legacy_fail_open() {
+        let mut channel = CaptureChannel::new(true);
+        channel.state = CaptureLinkStatus::Negotiating;
+        channel.ack_deadline = Some(Instant::now() + ACK_TIMEOUT);
+        channel.demand = true;
+
+        channel.ack_timed_out();
+
+        assert_eq!(channel.state, CaptureLinkStatus::Legacy);
+        assert!(channel.ack_deadline.is_none());
+        // Cached demand survives, but must not produce a control frame.
+        assert!(!channel.demand_dirty);
+    }
+
+    #[test]
+    fn legacy_channel_keeps_demand_but_never_sends() {
+        let mut channel = CaptureChannel::new(true);
+        channel.state = CaptureLinkStatus::Legacy;
+
+        channel.set_demand(true);
+        // Legacy peer: the cached demand must not produce a control frame.
+        assert!(!channel.demand_dirty);
+    }
+
+    #[test]
+    fn linked_channel_marks_demand_dirty() {
+        let mut channel = CaptureChannel::new(true);
+        channel.state = CaptureLinkStatus::Linked;
+
+        channel.set_demand(true);
+        assert!(channel.demand_dirty);
+    }
 
     #[test]
     fn rebind_delay_grows_then_caps() {
