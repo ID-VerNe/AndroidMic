@@ -138,6 +138,44 @@ After setup, the virtual microphone will appear in your system's audio input dev
 
 ---
 
+## On-Demand Capture
+
+By default the phone keeps the microphone recording for the whole connection. With on-demand capture the PC watches the virtual-cable **capture** endpoint (the paired side of the playback cable AndroidMic writes to): when no application is actively recording from it, the PC tells the phone to stop capturing, and resumes it the moment an app opens the endpoint. This keeps the mic idle when nobody is listening, at the cost of a short resume delay.
+
+### PC configuration
+
+The settings live in the PC app config file (`AndroidMic.toml` under the app config directory) under the `[on_demand_capture]` section. Older config files without this section load the defaults below.
+
+```toml
+[on_demand_capture]
+# Master switch. When false the PC never negotiates on-demand capture and keeps
+# the legacy always-on behaviour. Default: true.
+enabled = true
+
+# Friendly-name substring of the virtual-cable capture endpoint to watch
+# (e.g. "CABLE Output"). Matched case-insensitively as a substring, so a short
+# hint can disambiguate several virtual cables. Empty means auto-detect the
+# default VB-Cable output ("CABLE Output"). Default: "".
+endpoint_id = ""
+```
+
+### How it works
+
+1. **Handshake**: after a WiFi (TCP) or ADB connect, the PC sends a capture hello (protocol version, capabilities, nonce, initial demand); the phone replies with a hello ack. An unsupported protocol version, or a peer that never answers the hello, stays in legacy always-on mode.
+2. **Control frames**: as the watched endpoint gains or loses active consumers, the PC sends capture control frames with the current demand state.
+3. **Silence keepalive tail**: after demand goes false, the phone keeps sending generated silence for about 1.5 s so the PC playout does not have to rebuffer; only then does it stop the recorder.
+4. **Degraded fail-open**: if the watcher cannot open or monitor the endpoint (endpoint not found, probe source unavailable, control channel breaks unexpectedly), the PC forces always-on capture end-to-end instead of cutting audio.
+5. **Legacy peers**: an old phone that does not answer the hello, or an old PC without the feature, both fall back to always-on. A muted phone takes priority: it does not capture even when the PC demands audio.
+
+### Limitations
+
+- **Transport**: the on-demand control channel only exists on WiFi (TCP) and USB ADB. USB Serial, UDP, and the removed Bluetooth path keep the legacy always-on behaviour.
+- **Exclusive mode**: the watcher monitors shared WASAPI sessions on the capture endpoint. If another application holds the virtual-cable endpoint exclusively, or the endpoint exposes no shareable session, the watcher cannot see consumers and degrades to fail-open always-on.
+- **Platform**: the probe source is Windows-only; on other platforms the feature degrades to always-on.
+- The recorder retention strategies used to trade idle power against resume latency are internal debug-only experiments; release builds always use the standard stop-after-tail behaviour and expose no setting for them.
+
+---
+
 ## Troubleshooting
 
 ### Can't hear audio / No microphone detected
