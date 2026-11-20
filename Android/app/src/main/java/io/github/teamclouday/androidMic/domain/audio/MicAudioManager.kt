@@ -41,6 +41,7 @@ class MicAudioManager(
     val audioSource: Int,
     // use the unprocessed source even when the device doesn't advertise support for it
     val forceUnprocessed: Boolean = false,
+    private val gate: CaptureGate = CaptureGate(),
 ) {
 
     companion object {
@@ -52,15 +53,26 @@ class MicAudioManager(
         // the record buffer is kept drained so its size doesn't add latency,
         // a big one just survives longer scheduling or network hiccups without losing audio
         const val RECORD_BUFFER_MS = 500
+
+        // after capture goes idle, keep sending generated silence this long so the PC
+        // playout doesn't have to rebuffer; then stop sending entirely
+        const val SILENCE_KEEPALIVE_MS = 1500L
     }
 
-    private val recorder: AudioRecord
-    private val effects: List<AudioEffect>
+    private var recorder: AudioRecord
+    private var effects: List<AudioEffect> = emptyList()
     private val chunkSize: Int
     private val buffer: ByteArray
     private val bufferFloat: FloatArray
     private val bufferFloatConvert: ByteBuffer
     private var streamJob: Job? = null
+
+    // recorder configuration kept for error recovery rebuilds
+    private var channelConfig: Int = 0
+    private var bufferSize: Int = 0
+    private var minBufferSize: Int = 0
+    private var currentSource: Int = audioSource
+    private var unprocessedRequested: Boolean = false
 
     // reading the mic on a normal priority thread adds scheduling jitter
     private val captureDispatcher = Executors.newSingleThreadExecutor { r ->
@@ -71,6 +83,9 @@ class MicAudioManager(
     }.asCoroutineDispatcher()
 
     private var isMuted = false
+
+    // wall-clock deadline until which generated silence keeps flowing after capture goes idle
+    private var keepaliveUntilMs = 0L
 
     // true when the unprocessed source was requested but the device can't provide it
     var isUnprocessedFallback = false
@@ -91,9 +106,9 @@ class MicAudioManager(
         }
 
         // get minimum buffer size
-        val channelConfig =
+        channelConfig =
             if (channelCount == 2) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
-        val minBufferSize = AudioRecord.getMinBufferSize(
+        minBufferSize = AudioRecord.getMinBufferSize(
             sampleRate,
             channelConfig,
             audioFormat,
@@ -109,37 +124,28 @@ class MicAudioManager(
             minBufferSize * 2 / frameSize,
             sampleRate * RECORD_BUFFER_MS / 1000
         )
-        val bufferSize = bufferFrames * frameSize
+        bufferSize = bufferFrames * frameSize
 
-        val isUnprocessed = isUnprocessedSource(audioSource)
+        unprocessedRequested = isUnprocessedSource(audioSource)
 
         // the unprocessed source behaves like the default (processed) one when the device
         // doesn't support it, voice recognition is a better match in that case
         var source = audioSource
-        if (isUnprocessed && !forceUnprocessed && !isUnprocessedSupported(ctx)) {
+        if (unprocessedRequested && !forceUnprocessed && !isUnprocessedSupported(ctx)) {
             Log.w(TAG, "unprocessed audio source not supported, using voice recognition")
             source = MediaRecorder.AudioSource.VOICE_RECOGNITION
             isUnprocessedFallback = true
         }
-
-        // init recorder, with the minimum buffer if the device refuses a big one
-        fun createRecorder(source: Int): AudioRecord {
-            val rec = AudioRecord(source, sampleRate, channelConfig, audioFormat, bufferSize)
-            if (rec.state == AudioRecord.STATE_INITIALIZED || bufferSize <= minBufferSize) {
-                return rec
-            }
-            Log.w(TAG, "record buffer of $bufferSize bytes refused, using $minBufferSize")
-            rec.release()
-            return AudioRecord(source, sampleRate, channelConfig, audioFormat, minBufferSize)
-        }
+        currentSource = source
 
         var rec = createRecorder(source)
 
-        if (rec.state != AudioRecord.STATE_INITIALIZED && !isUnprocessedFallback && isUnprocessed) {
+        if (rec.state != AudioRecord.STATE_INITIALIZED && !isUnprocessedFallback && unprocessedRequested) {
             Log.w(TAG, "unprocessed audio source failed to initialize, using voice recognition")
             rec.release()
-            rec = createRecorder(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+            currentSource = MediaRecorder.AudioSource.VOICE_RECOGNITION
             isUnprocessedFallback = true
+            rec = createRecorder(currentSource)
         }
         recorder = rec
 
@@ -148,7 +154,7 @@ class MicAudioManager(
             "Microphone recording failed to initialize"
         }
 
-        effects = if (isUnprocessed) disablePreProcessing(recorder.audioSessionId) else emptyList()
+        effects = if (unprocessedRequested) disablePreProcessing(recorder.audioSessionId) else emptyList()
 
         buffer = ByteArray(chunkSize)
         bufferFloat = FloatArray(chunkSize / 4) // float is 4 bytes
@@ -157,61 +163,99 @@ class MicAudioManager(
         Log.d(TAG, "record buffer: $bufferSize bytes, chunk: $chunkSize bytes")
     }
 
+    // init recorder, with the minimum buffer if the device refuses a big one
+    private fun createRecorder(source: Int): AudioRecord {
+        val rec = AudioRecord(source, sampleRate, channelConfig, audioFormat, bufferSize)
+        if (rec.state == AudioRecord.STATE_INITIALIZED || bufferSize <= minBufferSize) {
+            return rec
+        }
+        Log.w(TAG, "record buffer of $bufferSize bytes refused, using $minBufferSize")
+        rec.release()
+        return AudioRecord(source, sampleRate, channelConfig, audioFormat, minBufferSize)
+    }
+
     // audio stream publisher
     fun audioStream(): Flow<AudioPacket> = channelFlow {
         // launch in scope so infinite loop will be canceled when scope exits
         streamJob = scope.launch(captureDispatcher) {
+            var wasCapturing = true
             while (true) {
 
-                if (recorder.state != AudioRecord.STATE_INITIALIZED || recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                    delay(RECORD_DELAY_MS)
-                    continue
-                }
+                val capturing = gate.update(isMuted)
 
-                val readCount: Int // number of samples read (for float) or number of bytes read (for int)
-                val packetBuffer: ByteArray
+                if (capturing) {
+                    keepaliveUntilMs = 0L
+                    setCapturing(true)
 
-                if (audioFormat == AudioFormat.ENCODING_PCM_FLOAT) {
-                    readCount =
-                        recorder.read(bufferFloat, 0, bufferFloat.size, AudioRecord.READ_BLOCKING)
-
-                    if (readCount > 0) {
-                        bufferFloatConvert.clear()
-                        bufferFloatConvert.asFloatBuffer().put(bufferFloat, 0, readCount)
-                        packetBuffer = bufferFloatConvert.array().copyOf(readCount * 4)
-                    } else {
-                        packetBuffer = ByteArray(0)
+                    if (recorder.state != AudioRecord.STATE_INITIALIZED ||
+                        recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING
+                    ) {
+                        delay(RECORD_DELAY_MS)
+                        continue
                     }
-                } else {
-                    readCount = recorder.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
 
-                    if (readCount > 0) {
-                        packetBuffer = ByteArray(readCount)
-                        buffer.copyInto(packetBuffer, 0, 0, readCount)
+                    val readCount: Int // number of samples read (for float) or number of bytes read (for int)
+                    val packetBuffer: ByteArray
+
+                    if (audioFormat == AudioFormat.ENCODING_PCM_FLOAT) {
+                        readCount =
+                            recorder.read(bufferFloat, 0, bufferFloat.size, AudioRecord.READ_BLOCKING)
+
+                        if (readCount > 0) {
+                            bufferFloatConvert.clear()
+                            bufferFloatConvert.asFloatBuffer().put(bufferFloat, 0, readCount)
+                            packetBuffer = bufferFloatConvert.array().copyOf(readCount * 4)
+                        } else {
+                            packetBuffer = ByteArray(0)
+                        }
                     } else {
-                        packetBuffer = ByteArray(0)
+                        readCount = recorder.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
+
+                        if (readCount > 0) {
+                            packetBuffer = ByteArray(readCount)
+                            buffer.copyInto(packetBuffer, 0, 0, readCount)
+                        } else {
+                            packetBuffer = ByteArray(0)
+                        }
                     }
-                }
 
-                if (readCount <= 0) {
-                    delay(RECORD_DELAY_MS)
-                    continue
-                }
+                    if (readCount <= 0) {
+                        delay(RECORD_DELAY_MS)
+                        continue
+                    }
 
-                // keep the stream going while muted, so the PC doesn't have to buffer it again
-                // and no stale audio piles up in the record buffer
-                if (isMuted) {
-                    packetBuffer.fill(silence(audioFormat))
-                }
+                    // legacy PC (no on-demand handshake): keep reading the mic and fill silence
+                    // while muted, exactly like the pre-on-demand behaviour
+                    if (!gate.linked && isMuted) {
+                        packetBuffer.fill(silence(audioFormat))
+                    }
 
-                send(
-                    AudioPacket(
-                        buffer = packetBuffer,
-                        sampleRate = sampleRate,
-                        audioFormat = audioFormat,
-                        channelCount = channelCount
+                    send(
+                        AudioPacket(
+                            buffer = packetBuffer,
+                            sampleRate = sampleRate,
+                            audioFormat = audioFormat,
+                            channelCount = channelCount
+                        )
                     )
-                )
+                } else {
+                    // idle: don't block on read, keep the TCP stream alive
+                    setCapturing(false)
+
+                    val now = System.currentTimeMillis()
+                    if (wasCapturing) {
+                        keepaliveUntilMs = now + SILENCE_KEEPALIVE_MS
+                    }
+
+                    if (now < keepaliveUntilMs) {
+                        send(silencePacket())
+                        delay(CHUNK_MS.toLong())
+                    } else {
+                        delay(RECORD_DELAY_MS)
+                    }
+                }
+
+                wasCapturing = capturing
             }
         }
 
@@ -230,14 +274,72 @@ class MicAudioManager(
 
     // start recording
     fun start() {
-        recorder.startRecording()
+        setCapturing(true)
         Log.d(TAG, "start")
     }
 
     // stop recording
     fun stop() {
-        recorder.stop()
+        setCapturing(false)
         Log.d(TAG, "stop")
+    }
+
+    /**
+     * Drive the recorder recording state to match [recording]. On an [IllegalStateException]
+     * or an uninitialized recorder, release and rebuild with the init parameters; if the
+     * rebuild still fails, log it and fail-open (the loop keeps retrying) instead of going
+     * silently mute.
+     */
+    fun setCapturing(recording: Boolean) {
+        try {
+            if (recording) {
+                if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    recorder.startRecording()
+                }
+            } else {
+                if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    recorder.stop()
+                }
+            }
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "recorder state error (capturing=$recording): ${e.message}; rebuilding")
+            rebuildRecorder()
+        } catch (e: Exception) {
+            Log.w(TAG, "recorder control error (capturing=$recording): ${e.message}")
+        }
+    }
+
+    private fun rebuildRecorder() {
+        try {
+            effects.forEach { runCatching { it.release() } }
+            recorder.release()
+
+            val fresh = createRecorder(currentSource)
+            if (fresh.state == AudioRecord.STATE_INITIALIZED) {
+                recorder = fresh
+                effects = if (unprocessedRequested) disablePreProcessing(fresh.audioSessionId) else emptyList()
+                return
+            }
+            fresh.release()
+
+            // mirror the init fallback to the processed voice recognition source
+            if (unprocessedRequested && !isUnprocessedFallback) {
+                currentSource = MediaRecorder.AudioSource.VOICE_RECOGNITION
+                isUnprocessedFallback = true
+                Log.w(TAG, "rebuild: falling back to voice recognition source")
+                val fallback = createRecorder(currentSource)
+                if (fallback.state == AudioRecord.STATE_INITIALIZED) {
+                    recorder = fallback
+                    effects = disablePreProcessing(fallback.audioSessionId)
+                    return
+                }
+                fallback.release()
+            }
+
+            Log.e(TAG, "recorder rebuild failed to initialize; fail-open best effort")
+        } catch (e: Exception) {
+            Log.e(TAG, "recorder rebuild failed: ${e.message}; fail-open best effort")
+        }
     }
 
     // shutdown manager
@@ -249,6 +351,17 @@ class MicAudioManager(
         effects.forEach { it.release() }
         captureDispatcher.close()
         Log.d(TAG, "shutdown")
+    }
+
+    private fun silencePacket(): AudioPacket {
+        val buf = ByteArray(chunkSize)
+        buf.fill(silence(audioFormat))
+        return AudioPacket(
+            buffer = buf,
+            sampleRate = sampleRate,
+            audioFormat = audioFormat,
+            channelCount = channelCount
+        )
     }
 
     private fun bytesPerSample(format: Int): Int {
