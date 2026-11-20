@@ -34,3 +34,46 @@ pub mod message_wrapper {
         Connect(super::ConnectMessage),
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CaptureHello {
+    /// 1
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    /// bit0: on-demand capture
+    #[prost(uint32, tag = "2")]
+    pub capabilities: u32,
+    #[prost(uint32, tag = "3")]
+    pub nonce: u32,
+    /// 连接时 PC 的初始需求状态
+    #[prost(bool, tag = "4")]
+    pub capture_enabled: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CaptureControl {
+    #[prost(bool, tag = "1")]
+    pub enabled: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CaptureEnvelope {
+    #[prost(oneof = "capture_envelope::Payload", tags = "1, 2")]
+    pub payload: ::core::option::Option<capture_envelope::Payload>,
+}
+/// Nested message and enum types in `CaptureEnvelope`.
+pub mod capture_envelope {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "1")]
+        Hello(super::CaptureHello),
+        #[prost(message, tag = "2")]
+        Control(super::CaptureControl),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CaptureHelloAck {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(uint32, tag = "2")]
+    pub capabilities: u32,
+    #[prost(uint32, tag = "3")]
+    pub nonce: u32,
+}

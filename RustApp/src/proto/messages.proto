@@ -22,3 +22,25 @@ message MessageWrapper {
     ConnectMessage connect = 2;
   }
 }
+
+message CaptureHello {
+  uint32 protocol_version = 1; // 1
+  uint32 capabilities = 2;     // bit0: on-demand capture
+  uint32 nonce = 3;
+  bool capture_enabled = 4;    // 连接时 PC 的初始需求状态
+}
+
+message CaptureControl { bool enabled = 1; }
+
+message CaptureEnvelope {
+  oneof payload {
+    CaptureHello hello = 1;
+    CaptureControl control = 2;
+  }
+}
+
+message CaptureHelloAck {
+  uint32 protocol_version = 1;
+  uint32 capabilities = 2;
+  uint32 nonce = 3;
+}
