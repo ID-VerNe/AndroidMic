@@ -31,3 +31,19 @@ pub fn create_source(
         Err(WatcherError::UnsupportedPlatform)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(target_os = "windows"))]
+    use super::*;
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_source_is_unsupported_platform_fail_open() {
+        // Non-Windows enters Degraded; the control channel forces always-on.
+        assert_eq!(
+            create_source(&OnDemandCaptureConfig::default()).unwrap_err(),
+            WatcherError::UnsupportedPlatform
+        );
+    }
+}

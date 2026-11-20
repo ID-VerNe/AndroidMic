@@ -69,6 +69,8 @@ pub enum StreamerCommand {
     /// Debounced on-demand demand from the PC session watcher. Only honoured
     /// once the control channel is linked; otherwise ignored (fail-open).
     SetCaptureDemand(bool),
+    /// Local probe source degraded/recovered. Degradation forces capture on.
+    SetCaptureDegraded(bool),
     Stop,
 }
 
@@ -98,6 +100,7 @@ impl Debug for StreamerCommand {
             Self::Stop => write!(f, "Stop"),
             Self::SetWindowVisible(visible) => write!(f, "SetWindowVisible({visible})"),
             Self::SetCaptureDemand(enabled) => write!(f, "SetCaptureDemand({enabled})"),
+            Self::SetCaptureDegraded(degraded) => write!(f, "SetCaptureDegraded({degraded})"),
         }
     }
 }
@@ -249,6 +252,9 @@ pub fn sub() -> impl Stream<Item = StreamerMsg> {
                             }
                             StreamerCommand::SetCaptureDemand(enabled) => {
                                 streamer.set_capture_demand(enabled);
+                            }
+                            StreamerCommand::SetCaptureDegraded(degraded) => {
+                                streamer.set_capture_degraded(degraded);
                             }
                         }
                     }

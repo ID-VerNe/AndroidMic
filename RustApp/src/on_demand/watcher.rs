@@ -4,6 +4,7 @@
 //! The COM/source layer lives on this dedicated thread so its apartment state
 //! is consistent; the UI side only sees plain [`WatcherUpdate`] values.
 
+use std::panic::{self, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 
 use cosmic::iced::futures::SinkExt;
@@ -13,6 +14,7 @@ use tokio::sync::{
     Mutex,
     mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
+use tracing::warn;
 
 use super::{Consumer, create_source, DemandMachine, OnDemandCaptureConfig, WatcherError};
 
@@ -54,16 +56,41 @@ impl WatcherStream {
     }
 }
 
-/// Spawn the watcher thread. A source construction failure is reported as a
-/// one-shot [`WatcherUpdate::Degraded`]; the caller treats it as always-on.
+/// Spawn the watcher thread. A source construction failure, a mid-run panic,
+/// or a failed spawn is reported as a [`WatcherUpdate::Degraded`]; the caller
+/// treats every one of them as always-on (fail-open).
 pub fn spawn_watcher(config: &OnDemandCaptureConfig) -> WatcherStream {
     let (tx, rx) = mpsc::unbounded_channel();
     let config = config.clone();
 
-    std::thread::Builder::new()
+    let tx_thread = tx.clone();
+    let spawned = std::thread::Builder::new()
         .name("on-demand-watcher".into())
-        .spawn(move || run_watcher(config, tx))
-        .expect("failed to spawn on-demand watcher thread");
+        .spawn(move || {
+            // Catch any panic from the COM/source layer and report Degraded
+            // instead of letting the thread die silently on the last state.
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                run_watcher(config, tx_thread.clone())
+            }));
+            if let Err(payload) = result {
+                let reason = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned());
+                match reason {
+                    Some(reason) => {
+                        warn!("on-demand watcher panicked: {reason}; forcing always-on")
+                    }
+                    None => warn!("on-demand watcher panicked; forcing always-on"),
+                }
+                let _ = tx_thread.send(WatcherUpdate::Degraded(WatcherError::ThreadPanicked));
+            }
+        });
+
+    if spawned.is_err() {
+        warn!("failed to spawn on-demand watcher thread; forcing always-on");
+        let _ = tx.send(WatcherUpdate::Degraded(WatcherError::SpawnFailed));
+    }
 
     WatcherStream {
         receiver: std::sync::Arc::new(Mutex::new(rx)),

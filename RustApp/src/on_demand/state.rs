@@ -29,6 +29,11 @@ pub enum WatcherError {
     EndpointNotFound,
     /// COM enumeration failed for another reason.
     EnumerationFailed,
+    /// The watcher thread could not be spawned at all.
+    SpawnFailed,
+    /// The watcher thread panicked mid-run; fail open rather than stall on the
+    /// last reported state.
+    ThreadPanicked,
 }
 
 /// Off-debounce: how long demand stays on after the last consumer leaves.

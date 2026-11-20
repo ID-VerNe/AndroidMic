@@ -71,6 +71,9 @@ struct CaptureChannel {
     demand: bool,
     /// Demand changed while linked and still needs to be flushed to the peer.
     demand_dirty: bool,
+    /// The local probe source is unavailable: fail open by forcing capture on.
+    /// While degraded, a `false` demand can never pull the phone back to muted.
+    degraded: bool,
 }
 
 impl CaptureChannel {
@@ -82,19 +85,44 @@ impl CaptureChannel {
             ack_deadline: None,
             demand: false,
             demand_dirty: false,
+            degraded: false,
         }
     }
 
     /// Record a debounced demand change. Only a linked channel marks the demand
     /// dirty so it can be flushed; before the ack arrives or on a legacy peer
-    /// the demand is cached but never sent (fail-open).
+    /// the demand is cached but never sent (fail-open). While degraded the
+    /// forced-on state wins: a `false` demand cannot mute the phone.
     fn set_demand(&mut self, enabled: bool) {
+        if self.degraded && !enabled {
+            return;
+        }
         let changed = self.demand != enabled;
         self.demand = enabled;
 
         if changed && self.state == CaptureLinkStatus::Linked {
             self.demand_dirty = true;
         }
+    }
+
+    /// Mark the local probe source degraded (or recover from it). Degradation
+    /// forces capture on end-to-end: the Hello advertises `capture_enabled=true`
+    /// and, once linked, a `Control(true)` is flushed.
+    fn set_degraded(&mut self, degraded: bool) {
+        self.degraded = degraded;
+        if degraded {
+            let changed = !self.demand;
+            self.demand = true;
+            if changed && self.state == CaptureLinkStatus::Linked {
+                self.demand_dirty = true;
+            }
+        }
+    }
+
+    /// Demand advertised on the Hello and flushed on Control: degraded fails
+    /// open to always-on.
+    fn effective_demand(&self) -> bool {
+        self.degraded || self.demand
     }
 
     /// Ack did not arrive within the timeout: treat the peer as legacy and stay
@@ -183,6 +211,10 @@ impl StreamerTrait for TcpStreamer {
         self.capture.set_demand(enabled);
     }
 
+    fn set_capture_degraded(&mut self, degraded: bool) {
+        self.capture.set_degraded(degraded);
+    }
+
     fn set_window_visible(&mut self, visible: bool) {
         if self.stream_config.is_window_visible != visible {
             info!("window visibility changed: {visible}");
@@ -269,7 +301,7 @@ impl StreamerTrait for TcpStreamer {
                         protocol_version: CAPTURE_PROTOCOL_VERSION,
                         capabilities: CAPTURE_CAPABILITIES_ON_DEMAND,
                         nonce: self.capture.nonce,
-                        capture_enabled: self.capture.demand,
+                        capture_enabled: self.capture.effective_demand(),
                     };
                     let envelope = CaptureEnvelope {
                         payload: Some(Payload::Hello(hello)),
@@ -350,34 +382,52 @@ impl StreamerTrait for TcpStreamer {
 
                 match frame_result {
                     Some(Ok(frame)) => {
-                        // Classify the ack before treating the frame as audio, but
-                        // only while still negotiating. A non-matching ack falls
-                        // through to the audio decoder below.
-                        if self.capture.state == CaptureLinkStatus::Negotiating
-                            && let Ok(ack) = CaptureHelloAck::decode(&frame[..])
-                        {
-                            if ack_matches(&ack, self.capture.nonce) {
-                                info!(
-                                    "CaptureHelloAck matched (nonce={}), on-demand linked",
-                                    ack.nonce
-                                );
-                                self.capture.state = CaptureLinkStatus::Linked;
-                                self.capture.ack_deadline = None;
-                                // Re-emit the current demand now that the
-                                // control channel is live.
-                                self.capture.demand_dirty = true;
-                                return Ok(Some(StreamerMsg::CaptureLink(
-                                    CaptureLinkStatus::Linked,
-                                )));
+                        // A frame that decodes as a CaptureHelloAck is consumed in
+                        // every state. A mismatched or late ack must never reach
+                        // the audio decoder: the ack's varint fields clash with the
+                        // audio packet's length-delimited buffer, and a decoder
+                        // mismatch would surface as a Fatal deserializer error
+                        // that drops the stream.
+                        let mut ack_consumed = false;
+                        if let Ok(ack) = CaptureHelloAck::decode(&frame[..]) {
+                            match self.capture.state {
+                                CaptureLinkStatus::Negotiating
+                                    if ack_matches(&ack, self.capture.nonce) =>
+                                {
+                                    info!(
+                                        "CaptureHelloAck matched (nonce={}), on-demand linked",
+                                        ack.nonce
+                                    );
+                                    self.capture.state = CaptureLinkStatus::Linked;
+                                    self.capture.ack_deadline = None;
+                                    // Re-emit the current demand now that the
+                                    // control channel is live.
+                                    self.capture.demand_dirty = true;
+                                    return Ok(Some(StreamerMsg::CaptureLink(
+                                        CaptureLinkStatus::Linked,
+                                    )));
+                                }
+                                CaptureLinkStatus::Negotiating => {
+                                    warn!(
+                                        "CaptureHelloAck nonce/version mismatch (got {}, expected {}); \
+                                         legacy, fail-open",
+                                        ack.nonce, self.capture.nonce
+                                    );
+                                    self.capture.state = CaptureLinkStatus::Legacy;
+                                }
+                                other => {
+                                    warn!(
+                                        "late/stray CaptureHelloAck ignored (state={other:?}, ack nonce={})",
+                                        ack.nonce
+                                    );
+                                }
                             }
-                            warn!(
-                                "CaptureHelloAck nonce/version mismatch (got {}, expected {}); \
-                                 legacy, fail-open",
-                                ack.nonce, self.capture.nonce
-                            );
-                            self.capture.state = CaptureLinkStatus::Legacy;
+                            ack_consumed = true;
                         }
 
+                        if ack_consumed {
+                            Outcome::Msg(None)
+                        } else {
                         match AudioPacketMessage::decode(&frame[..]) {
                             Ok(packet) => {
                                 let buffer_size = packet.buffer.len();
@@ -402,6 +452,7 @@ impl StreamerTrait for TcpStreamer {
                             Err(e) => Outcome::Fatal(ConnectError::WriteError(
                                 WriteError::Deserializer(e),
                             )),
+                        }
                         }
                     }
 
@@ -587,6 +638,72 @@ mod tests {
 
         channel.set_demand(true);
         assert!(channel.demand_dirty);
+    }
+
+    #[test]
+    fn degraded_forces_always_on_before_and_after_link() {
+        // Probe source unavailable / endpoint missing / COM failure / non-Windows
+        // all surface as Degraded; the phone-facing demand must be on in every
+        // state, both before the Hello and after linking.
+        let mut before_link = CaptureChannel::new(true);
+        before_link.state = CaptureLinkStatus::Negotiating;
+
+        before_link.set_degraded(true);
+        assert!(before_link.effective_demand());
+        assert!(before_link.demand);
+        // Not linked yet: nothing to flush, but the cached demand is on.
+        assert!(!before_link.demand_dirty);
+
+        let mut linked = CaptureChannel::new(true);
+        linked.state = CaptureLinkStatus::Linked;
+        linked.set_demand(false);
+
+        linked.set_degraded(true);
+        // Degradation while linked flushes Control(true).
+        assert!(linked.demand_dirty);
+        assert!(linked.effective_demand());
+    }
+
+    #[test]
+    fn degraded_ignores_demand_false_so_phone_is_never_muted() {
+        let mut channel = CaptureChannel::new(true);
+        channel.state = CaptureLinkStatus::Linked;
+        channel.set_degraded(true);
+        channel.demand_dirty = false;
+
+        // A late/queued false demand must not pull the phone back to muted
+        // while the source is degraded.
+        channel.set_demand(false);
+        assert!(channel.demand, "degraded demand stays on");
+        assert!(channel.effective_demand());
+        assert!(!channel.demand_dirty);
+    }
+
+    #[test]
+    fn recovery_clears_degradation_and_allows_demand_false_again() {
+        let mut channel = CaptureChannel::new(true);
+        channel.state = CaptureLinkStatus::Linked;
+        channel.set_degraded(true);
+
+        // A later healthy snapshot clears degradation; normal demand resumes.
+        channel.set_degraded(false);
+        channel.set_demand(false);
+        assert!(!channel.degraded);
+        assert!(!channel.demand);
+        assert!(!channel.effective_demand());
+        assert!(channel.demand_dirty);
+    }
+
+    #[test]
+    fn degraded_demand_overrides_cached_off_demand_on_hello() {
+        // The Hello advertises the effective demand: a degraded session must
+        // send capture_enabled=true even if the last cached demand was off.
+        let mut channel = CaptureChannel::new(true);
+        channel.set_demand(false);
+        assert!(!channel.effective_demand());
+
+        channel.set_degraded(true);
+        assert!(channel.effective_demand());
     }
 
     #[test]

@@ -88,6 +88,11 @@ trait StreamerTrait {
     /// Apply a debounced on-demand demand update. Transports without a control
     /// channel (UDP/USB) ignore this by default; the demand stays always-on.
     fn set_capture_demand(&mut self, _enabled: bool) {}
+
+    /// Mark the local probe source degraded/recovered. Degradation forces
+    /// capture on end-to-end (fail-open); transports without a control channel
+    /// ignore this by default.
+    fn set_capture_degraded(&mut self, _degraded: bool) {}
 }
 #[allow(clippy::enum_variant_names)]
 #[enum_dispatch(StreamerTrait)]
@@ -201,6 +206,7 @@ mod transport_isolation_tests {
                 "CaptureControl",
                 "CaptureHelloAck",
                 "set_capture_demand",
+                "set_capture_degraded",
             ] {
                 assert!(
                     !text.contains(banned),

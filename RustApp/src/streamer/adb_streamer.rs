@@ -290,6 +290,10 @@ impl StreamerTrait for AdbStreamer {
         self.tcp_streamer.set_capture_demand(enabled)
     }
 
+    fn set_capture_degraded(&mut self, degraded: bool) {
+        self.tcp_streamer.set_capture_degraded(degraded)
+    }
+
     fn status(&self) -> StreamerMsg {
         match &self.tcp_streamer.state {
             TcpStreamerState::Listening { .. } => StreamerMsg::Listening {

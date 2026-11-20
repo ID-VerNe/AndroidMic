@@ -806,13 +806,21 @@ impl Application for AppState {
                     } else {
                         WatcherState::DemandOff
                     };
-                    // The transport ignores this until the control channel is
-                    // linked; a legacy peer simply stays always-on.
+                    // A healthy snapshot clears any previous degradation, then
+                    // the debounced demand applies. The transport ignores this
+                    // until the control channel is linked; a legacy peer simply
+                    // stays always-on.
+                    self.send_command(StreamerCommand::SetCaptureDegraded(false));
                     self.send_command(StreamerCommand::SetCaptureDemand(active));
                 }
                 WatcherUpdate::Degraded(error) => {
-                    warn!("on-demand watcher degraded ({error:?}); staying always-on");
+                    warn!("on-demand watcher degraded ({error:?}); forcing always-on");
                     self.watcher_state = WatcherState::Degraded;
+                    // Fail open end-to-end: the probe source is unavailable, so
+                    // the phone must keep capturing. The degraded flag forces
+                    // `Control(true)` (and a `capture_enabled=true` Hello); a
+                    // later Demand snapshot clears it once the source recovers.
+                    self.send_command(StreamerCommand::SetCaptureDegraded(true));
                 }
             },
             AppMsg::Device(audio_device) => {
