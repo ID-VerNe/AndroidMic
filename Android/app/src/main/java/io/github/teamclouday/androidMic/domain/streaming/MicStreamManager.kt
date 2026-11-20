@@ -47,6 +47,10 @@ class MicStreamManager(
         streamer.start(audioStream, tx)
     }
 
+    fun setCaptureListener(listener: CaptureListener) {
+        streamer.setCaptureListener(listener)
+    }
+
     fun stop() {
         streamer.disconnect()
     }

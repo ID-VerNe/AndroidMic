@@ -16,7 +16,10 @@ import android.os.Process
 import android.util.Log
 import io.github.teamclouday.androidMic.Mode
 import io.github.teamclouday.androidMic.R
+import io.github.teamclouday.androidMic.domain.audio.CaptureGate
 import io.github.teamclouday.androidMic.domain.audio.MicAudioManager
+import io.github.teamclouday.androidMic.domain.streaming.CaptureListener
+import io.github.teamclouday.androidMic.domain.streaming.CaptureMessage
 import io.github.teamclouday.androidMic.domain.streaming.MicStreamManager
 import io.github.teamclouday.androidMic.utils.ignore
 import kotlinx.coroutines.CoroutineScope
@@ -68,12 +71,14 @@ class ForegroundService : Service() {
                 Command.Mute -> {
                     states.isMuted = true
                     managerAudio?.mute()
+                    captureGate?.update(true)
                     updateNotification()
                 }
 
                 Command.Unmute -> {
                     states.isMuted = false
                     managerAudio?.unmute()
+                    captureGate?.update(false)
                     updateNotification()
                 }
             }
@@ -92,6 +97,7 @@ class ForegroundService : Service() {
 
     private var managerAudio: MicAudioManager? = null
     private var managerStream: MicStreamManager? = null
+    private var captureGate: CaptureGate? = null
     private var wifiLocks: List<WifiManager.WifiLock> = emptyList()
 
 
@@ -153,6 +159,7 @@ class ForegroundService : Service() {
             MUTE_ACTION -> {
                 states.isMuted = true
                 managerAudio?.mute()
+                captureGate?.update(true)
                 updateNotification()
                 reply(uiMessenger, ResponseData(isMuted = true))
             }
@@ -160,6 +167,7 @@ class ForegroundService : Service() {
             UNMUTE_ACTION -> {
                 states.isMuted = false
                 managerAudio?.unmute()
+                captureGate?.update(false)
                 updateNotification()
                 reply(uiMessenger, ResponseData(isMuted = false))
             }
@@ -272,6 +280,25 @@ class ForegroundService : Service() {
         }
 
 
+        val gate = CaptureGate()
+        captureGate = gate
+        managerStream?.setCaptureListener(object : CaptureListener {
+            override fun onCaptureHello(hello: CaptureMessage.Hello) {
+                gate.link(hello.captureEnabled)
+                gate.update(states.isMuted)
+            }
+
+            override fun onCaptureControl(enabled: Boolean) {
+                gate.setPcEnabled(enabled)
+                gate.update(states.isMuted)
+            }
+
+            override fun onCaptureChannelClosed() {
+                // control channel broke unexpectedly: fail open back to always-on
+                gate.reset()
+            }
+        })
+
         if (!startAudio(msg, replyTo)) {
             shutdownStream()
             shutdownAudio()
@@ -327,6 +354,8 @@ class ForegroundService : Service() {
         managerStream = null
         states.isStreamStarted = false
         releaseWifiLocks()
+        captureGate?.reset()
+        captureGate = null
     }
 
     // wifi power saving holds packets back, sometimes for hundreds of ms
@@ -375,6 +404,7 @@ class ForegroundService : Service() {
                 channelCount = msg.channelCount!!.value,
                 audioSource = msg.audioSource!!,
                 forceUnprocessed = msg.forceUnprocessed,
+                gate = captureGate ?: CaptureGate(),
             )
         } catch (e: IllegalArgumentException) {
             reply(replyTo, ResponseData(msg = application.getString(R.string.error) + e.message))
