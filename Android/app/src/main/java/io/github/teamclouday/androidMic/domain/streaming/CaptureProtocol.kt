@@ -21,8 +21,19 @@ sealed interface CaptureMessage {
 
         /** capability bit 0: on-demand capture supported by the phone */
         const val CAPABILITY_ON_DEMAND = 1
+
+        // control frames are tiny; guard against a bogus length prefix
+        const val MAX_CONTROL_FRAME_PAYLOAD = 1024
     }
 }
+
+/** True when the hello protocol version is one the phone understands. */
+fun isSupportedProtocolVersion(version: Int): Boolean =
+    version == CaptureMessage.PROTOCOL_VERSION
+
+/** True when a control frame payload length is within the accepted bounds. */
+fun isValidControlFrameLength(len: Int): Boolean =
+    len in 1..CaptureMessage.MAX_CONTROL_FRAME_PAYLOAD
 
 /** Parse a CaptureEnvelope payload (length prefix already stripped). Null if unparseable or empty. */
 fun parseCaptureEnvelope(payload: ByteArray): CaptureMessage? {
@@ -73,7 +84,3 @@ fun buildCaptureHelloAck(nonce: Int): Messages.CaptureHelloAck =
         .setCapabilities(CaptureMessage.CAPABILITY_ON_DEMAND)
         .setNonce(nonce)
         .build()
-
-/** An ack matches the hello only when the nonce and protocol version line up. */
-fun helloAckMatches(ack: Messages.CaptureHelloAck, nonce: Int): Boolean =
-    ack.nonce == nonce && ack.protocolVersion == CaptureMessage.PROTOCOL_VERSION

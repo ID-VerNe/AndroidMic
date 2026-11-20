@@ -59,12 +59,13 @@ class MicAudioManager(
         const val SILENCE_KEEPALIVE_MS = 1500L
     }
 
-    private var recorder: AudioRecord
+    private var recorder: AudioRecord? = null
     private var effects: List<AudioEffect> = emptyList()
     private val chunkSize: Int
     private val buffer: ByteArray
     private val bufferFloat: FloatArray
     private val bufferFloatConvert: ByteBuffer
+    private val silenceBuffer: ByteArray
     private var streamJob: Job? = null
 
     // recorder configuration kept for error recovery rebuilds
@@ -73,6 +74,11 @@ class MicAudioManager(
     private var minBufferSize: Int = 0
     private var currentSource: Int = audioSource
     private var unprocessedRequested: Boolean = false
+
+    // minimum interval between recorder rebuild attempts, keeps a failing device from
+    // retrying every 5 ms chunk and flooding the log
+    private val rebuildRetryIntervalMs = 1000L
+    private var lastRebuildAttemptMs = 0L
 
     // reading the mic on a normal priority thread adds scheduling jitter
     private val captureDispatcher = Executors.newSingleThreadExecutor { r ->
@@ -150,15 +156,16 @@ class MicAudioManager(
         recorder = rec
 
         // check if recorder is initialized
-        require(recorder.state == AudioRecord.STATE_INITIALIZED) {
+        require(recorder?.state == AudioRecord.STATE_INITIALIZED) {
             "Microphone recording failed to initialize"
         }
 
-        effects = if (unprocessedRequested) disablePreProcessing(recorder.audioSessionId) else emptyList()
+        effects = if (unprocessedRequested) disablePreProcessing(recorder!!.audioSessionId) else emptyList()
 
         buffer = ByteArray(chunkSize)
         bufferFloat = FloatArray(chunkSize / 4) // float is 4 bytes
         bufferFloatConvert = ByteBuffer.allocate(chunkSize).order(ByteOrder.nativeOrder())
+        silenceBuffer = ByteArray(chunkSize).apply { fill(silence(audioFormat)) }
 
         Log.d(TAG, "record buffer: $bufferSize bytes, chunk: $chunkSize bytes")
     }
@@ -187,8 +194,9 @@ class MicAudioManager(
                     keepaliveUntilMs = 0L
                     setCapturing(true)
 
-                    if (recorder.state != AudioRecord.STATE_INITIALIZED ||
-                        recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING
+                    val rec = recorder
+                    if (rec == null || rec.state != AudioRecord.STATE_INITIALIZED ||
+                        rec.recordingState != AudioRecord.RECORDSTATE_RECORDING
                     ) {
                         delay(RECORD_DELAY_MS)
                         continue
@@ -199,7 +207,7 @@ class MicAudioManager(
 
                     if (audioFormat == AudioFormat.ENCODING_PCM_FLOAT) {
                         readCount =
-                            recorder.read(bufferFloat, 0, bufferFloat.size, AudioRecord.READ_BLOCKING)
+                            rec.read(bufferFloat, 0, bufferFloat.size, AudioRecord.READ_BLOCKING)
 
                         if (readCount > 0) {
                             bufferFloatConvert.clear()
@@ -209,7 +217,7 @@ class MicAudioManager(
                             packetBuffer = ByteArray(0)
                         }
                     } else {
-                        readCount = recorder.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
+                        readCount = rec.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
 
                         if (readCount > 0) {
                             packetBuffer = ByteArray(readCount)
@@ -287,18 +295,22 @@ class MicAudioManager(
     /**
      * Drive the recorder recording state to match [recording]. On an [IllegalStateException]
      * or an uninitialized recorder, release and rebuild with the init parameters; if the
-     * rebuild still fails, log it and fail-open (the loop keeps retrying) instead of going
-     * silently mute.
+     * rebuild still fails, the recorder field stays null and retries are throttled, failing
+     * open instead of going silently mute.
      */
     fun setCapturing(recording: Boolean) {
+        val rec = recorder ?: run {
+            rebuildRecorder()
+            return
+        }
         try {
             if (recording) {
-                if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                    recorder.startRecording()
+                if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    rec.startRecording()
                 }
             } else {
-                if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    recorder.stop()
+                if (rec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    rec.stop()
                 }
             }
         } catch (e: IllegalStateException) {
@@ -310,10 +322,16 @@ class MicAudioManager(
     }
 
     private fun rebuildRecorder() {
-        try {
-            effects.forEach { runCatching { it.release() } }
-            recorder.release()
+        val now = System.currentTimeMillis()
+        if (now - lastRebuildAttemptMs < rebuildRetryIntervalMs) return
+        lastRebuildAttemptMs = now
 
+        effects.forEach { runCatching { it.release() } }
+        effects = emptyList()
+        recorder?.let { runCatching { it.release() } }
+        recorder = null
+
+        try {
             val fresh = createRecorder(currentSource)
             if (fresh.state == AudioRecord.STATE_INITIALIZED) {
                 recorder = fresh
@@ -336,9 +354,9 @@ class MicAudioManager(
                 fallback.release()
             }
 
-            Log.e(TAG, "recorder rebuild failed to initialize; fail-open best effort")
+            Log.e(TAG, "recorder rebuild failed to initialize; recorder released, throttled retry, fail-open")
         } catch (e: Exception) {
-            Log.e(TAG, "recorder rebuild failed: ${e.message}; fail-open best effort")
+            Log.e(TAG, "recorder rebuild failed: ${e.message}; throttled retry, fail-open")
         }
     }
 
@@ -346,16 +364,17 @@ class MicAudioManager(
     // should not call any methods after calling
     fun shutdown() {
         streamJob?.cancel()
-        recorder.stop()
-        recorder.release()
-        effects.forEach { it.release() }
+        runCatching { recorder?.stop() }
+        runCatching { recorder?.release() }
+        recorder = null
+        effects.forEach { runCatching { it.release() } }
+        effects = emptyList()
         captureDispatcher.close()
         Log.d(TAG, "shutdown")
     }
 
     private fun silencePacket(): AudioPacket {
-        val buf = ByteArray(chunkSize)
-        buf.fill(silence(audioFormat))
+        val buf = silenceBuffer.copyOf()
         return AudioPacket(
             buffer = buf,
             sampleRate = sampleRate,

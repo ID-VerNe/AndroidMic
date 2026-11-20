@@ -40,9 +40,6 @@ class TcpStreamer(
 
     companion object {
 
-        // control frames are tiny; guard against a bogus length prefix
-        private const val MAX_CONTROL_FRAME_PAYLOAD = 1024
-
         fun wifi(
             ctx: Context,
             scope: CoroutineScope,
@@ -232,18 +229,26 @@ class TcpStreamer(
 
         readerJob = scope.launch {
             val input = socket.inputStream
+            var failure: String? = null
             while (isActive) {
                 val lenBuf = ByteArray(4)
-                if (!readFully(input, lenBuf)) break
+                if (!readFully(input, lenBuf)) {
+                    failure = "read failed or end of stream"
+                    break
+                }
 
                 val len = readBigEndianU32(lenBuf)
-                if (len <= 0 || len > MAX_CONTROL_FRAME_PAYLOAD) {
-                    Log.d(tag, "reader: unsupported control frame length $len, closing reader")
+                if (!isValidControlFrameLength(len)) {
+                    failure = "unsupported control frame length $len"
+                    Log.d(tag, "reader: ${failure}")
                     break
                 }
 
                 val payload = ByteArray(len)
-                if (!readFully(input, payload)) break
+                if (!readFully(input, payload)) {
+                    failure = "read failed or end of stream"
+                    break
+                }
 
                 val message = parseCaptureEnvelope(payload) ?: continue
                 when (message) {
@@ -251,12 +256,20 @@ class TcpStreamer(
                     is CaptureMessage.Control -> captureListener?.onCaptureControl(message.enabled)
                 }
             }
+
+            // An explicit disconnect nulls the socket; if it is still set the reader broke
+            // unexpectedly, so fail the control channel open instead of freezing the gate
+            // at its last state.
+            if (failure != null && this@TcpStreamer.socket != null) {
+                Log.w(tag, "reader: control channel closed unexpectedly (${failure}); failing open")
+                captureListener?.onCaptureChannelClosed()
+            }
             Log.d(tag, "reader: stopped")
         }
     }
 
     private fun handleHello(hello: CaptureMessage.Hello) {
-        if (hello.protocolVersion != CaptureMessage.PROTOCOL_VERSION) {
+        if (!isSupportedProtocolVersion(hello.protocolVersion)) {
             Log.d(tag, "unsupported hello protocol version ${hello.protocolVersion}, staying always-on")
             return
         }

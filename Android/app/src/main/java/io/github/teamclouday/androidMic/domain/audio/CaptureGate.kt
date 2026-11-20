@@ -18,6 +18,11 @@ package io.github.teamclouday.androidMic.domain.audio
  *
  * Note: the phone cannot see the PC-side process PID, so repeated triggers are counted via
  * `pcEnabled` rising edges as the equivalent of "the same PID re-opened the capture stream".
+ *
+ * Threading: all mutations happen under `synchronized(this)`. The published state
+ * ([linked], [pcEnabled], [isCapturing]) is `@Volatile` so the capture loop can read it
+ * off-lock without missing a writer's update. Mute while linked cancels any pending
+ * demand-off debounce: mute wins immediately rather than waiting out the off-delay.
  */
 class CaptureGate(
     private val clock: () -> Long = { System.currentTimeMillis() },
@@ -34,14 +39,17 @@ class CaptureGate(
     }
 
     /** whether the PC completed the on-demand handshake (Hello processed) */
+    @Volatile
     var linked: Boolean = false
         private set
 
     /** latest demand reported by the PC (only meaningful when [linked]) */
+    @Volatile
     var pcEnabled: Boolean = false
         private set
 
     /** true while the microphone should be recording */
+    @Volatile
     var isCapturing: Boolean = true
         private set
 

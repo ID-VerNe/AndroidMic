@@ -292,6 +292,11 @@ class ForegroundService : Service() {
                 gate.setPcEnabled(enabled)
                 gate.update(states.isMuted)
             }
+
+            override fun onCaptureChannelClosed() {
+                // control channel broke unexpectedly: fail open back to always-on
+                gate.reset()
+            }
         })
 
         if (!startAudio(msg, replyTo)) {

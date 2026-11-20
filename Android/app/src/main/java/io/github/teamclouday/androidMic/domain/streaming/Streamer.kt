@@ -16,6 +16,13 @@ const val DEFAULT_PORT: Int = 54345
 interface CaptureListener {
     fun onCaptureHello(hello: CaptureMessage.Hello) {}
     fun onCaptureControl(enabled: Boolean) {}
+
+    /**
+     * The control channel broke unexpectedly (protocol error or IO failure while the
+     * streamer was still supposed to be connected). The gate should fail open back to the
+     * unlinked always-on state. Not called for an explicit disconnect.
+     */
+    fun onCaptureChannelClosed() {}
 }
 
 interface Streamer {
