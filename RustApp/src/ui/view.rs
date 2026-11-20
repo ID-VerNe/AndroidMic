@@ -15,7 +15,7 @@ use cosmic::{
 use cpal::traits::DeviceTrait;
 
 use super::{
-    app::{AppState, ConnectionState},
+    app::{AppState, ConnectionState, OnDemandView},
     message::{AppMsg, ConfigMsg},
 };
 use crate::{
@@ -57,6 +57,7 @@ pub fn main_window(app: &AppState) -> Element<'_, AppMsg> {
                 )
                 .push(audio(app))
                 .push(vertical_space())
+                .push_maybe(app.on_demand_view().map(on_demand_status))
                 .push(connection_type(app)),
         )
         .into()
@@ -265,6 +266,22 @@ fn connect_button(app: &AppState) -> Element<'_, AppMsg> {
     .into()
 }
 
+fn on_demand_status(view: OnDemandView) -> Element<'static, AppMsg> {
+    let label = match view {
+        OnDemandView::Standby => fl!("on_demand_state_standby"),
+        OnDemandView::Capturing => fl!("on_demand_state_capturing"),
+        OnDemandView::Degraded => fl!("on_demand_state_degraded"),
+        OnDemandView::Legacy => fl!("on_demand_state_legacy"),
+    };
+
+    column()
+        .spacing(10)
+        .align_x(Horizontal::Center)
+        .push(text::title4(fl!("on_demand")))
+        .push(text(label))
+        .into()
+}
+
 pub fn settings_window(app: &AppState) -> Element<'_, ConfigMsg> {
     let config = app.config.data();
 
@@ -351,6 +368,37 @@ pub fn settings_window(app: &AppState) -> Element<'_, ConfigMsg> {
                                 .on_release(ConfigMsg::TargetLatencyApply),
                             ),
                     ),
+            )
+            .push(
+                settings::section()
+                    .title(fl!("on_demand"))
+                    .add(
+                        row()
+                            .align_y(Vertical::Center)
+                            .push(text(fl!("on_demand_enabled")))
+                            .push(horizontal_space())
+                            .push(
+                                toggler(config.on_demand_capture.enabled)
+                                    .on_toggle(ConfigMsg::OnDemandEnabled),
+                            ),
+                    )
+                    .add_maybe(config.on_demand_capture.enabled.then(|| {
+                        row()
+                            .width(Length::Fill)
+                            .align_y(Vertical::Center)
+                            .spacing(5)
+                            .push(text(fl!("on_demand_endpoint")))
+                            .push(horizontal_space())
+                            .push(
+                                text_input("", &app.on_demand_endpoint_input)
+                                    .on_input(ConfigMsg::OnDemandEndpointInput)
+                                    .width(Length::Fixed(150.0)),
+                            )
+                            .push(
+                                button::text(fl!("save"))
+                                    .on_press(ConfigMsg::OnDemandEndpointSave),
+                            )
+                    })),
             )
             .push(
                 settings::section()

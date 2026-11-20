@@ -37,7 +37,8 @@ use crate::{
         AppTheme, AudioFormat, ChannelCount, Config, ConnectionMode, NetworkAdapter, SampleRate,
     },
     fl, single_instance,
-    streamer::{self, ConnectOption, DEFAULT_PC_PORT, StreamerCommand, StreamerMsg},
+    on_demand::{WatcherStream, WatcherUpdate, spawn_watcher},
+    streamer::{self, CaptureLinkStatus, ConnectOption, DEFAULT_PC_PORT, StreamerCommand, StreamerMsg},
     ui::view::{SCROLLABLE_ID, about_window},
     utils::APP_ID,
     window_icon,
@@ -121,6 +122,33 @@ pub enum ConnectionState {
     Listening,
 }
 
+/// Debounced demand reported by the PC session watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WatcherState {
+    /// Watcher has not reported yet.
+    #[default]
+    Unknown,
+    /// No local client is recording; phone may stay idle.
+    DemandOff,
+    /// A real local client is actively recording.
+    DemandOn,
+    /// Watcher could not watch the endpoint; fail open to always-on.
+    Degraded,
+}
+
+/// Four on-demand UI states shown in the main window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDemandView {
+    /// Negotiation linked, but no local client is recording right now.
+    Standby,
+    /// Linked and a local client is recording: the phone is capturing.
+    Capturing,
+    /// Watcher/source degraded: fallback to legacy always-on capture.
+    Degraded,
+    /// Legacy peer (no matching ack): fallback to always-on capture.
+    Legacy,
+}
+
 fn is_adb_mode(mode: ConnectionMode) -> bool {
     #[cfg(feature = "adb")]
     {
@@ -176,6 +204,14 @@ pub struct AppState {
     pub audio_stream: Option<Stream>,
     pub audio_wave: AudioWave,
     pub connection_state: ConnectionState,
+    /// On-demand negotiation state reported by the transport.
+    pub capture_link: CaptureLinkStatus,
+    /// Latest demand from the PC session watcher.
+    pub watcher_state: WatcherState,
+    /// Dedicated watcher thread stream, when the feature is enabled.
+    pub on_demand_stream: Option<WatcherStream>,
+    /// Endpoint-name text input buffer (settings window).
+    pub on_demand_endpoint_input: String,
     pub network_adapters: Vec<NetworkAdapter>,
     pub network_adapter: Option<NetworkAdapter>,
     pub port_input: String,
@@ -232,6 +268,7 @@ impl AppState {
         self.connection_state = ConnectionState::Default;
         self.audio_stream = None;
         self.audio_wave.clear();
+        self.capture_link = CaptureLinkStatus::Inactive;
         self.sync_tray();
     }
 
@@ -304,6 +341,7 @@ impl AppState {
                     ip,
                     port: config.port,
                     keepalive: config.tcp_keepalive,
+                    on_demand_enabled: config.on_demand_capture.enabled,
                 }
             }
             ConnectionMode::Udp => {
@@ -322,6 +360,7 @@ impl AppState {
             ConnectionMode::Adb => ConnectOption::Adb {
                 port: config.port,
                 keepalive: config.tcp_keepalive,
+                on_demand_enabled: config.on_demand_capture.enabled,
             },
             #[cfg(feature = "usb")]
             ConnectionMode::Usb => ConnectOption::Usb,
@@ -348,6 +387,7 @@ impl AppState {
         self.connection_state = ConnectionState::Default;
         self.audio_stream = None;
         self.audio_wave.clear();
+        self.capture_link = CaptureLinkStatus::Inactive;
 
         self.sync_tray();
 
@@ -381,6 +421,33 @@ impl AppState {
 
     fn main_window_visible(&self) -> bool {
         self.main_window.is_some() && !self.main_window_hidden
+    }
+
+    /// Derived four-state on-demand view for the main window. `None` means the
+    /// feature is disabled and the legacy always-on UI applies.
+    pub fn on_demand_view(&self) -> Option<OnDemandView> {
+        if !self.config.data().on_demand_capture.enabled {
+            return None;
+        }
+
+        let mode = self.config.data().connection_mode;
+        let transport_supported = mode == ConnectionMode::Tcp || is_adb_mode(mode);
+        if !transport_supported || self.watcher_state == WatcherState::Degraded {
+            // UDP/USB have no control channel, and a failed watcher both fall
+            // back to the legacy always-on behaviour.
+            return Some(OnDemandView::Degraded);
+        }
+
+        match self.capture_link {
+            CaptureLinkStatus::Legacy => Some(OnDemandView::Legacy),
+            CaptureLinkStatus::Linked => match self.watcher_state {
+                WatcherState::DemandOn => Some(OnDemandView::Capturing),
+                _ => Some(OnDemandView::Standby),
+            },
+            CaptureLinkStatus::Inactive | CaptureLinkStatus::Negotiating => {
+                Some(OnDemandView::Standby)
+            }
+        }
     }
 
     fn open_main_window(&mut self) -> Task<AppMsg> {
@@ -515,6 +582,12 @@ impl Application for AppState {
         let mut commands = Vec::new();
 
         let config = flags.config.data().clone();
+        let on_demand_stream = if config.on_demand_capture.enabled {
+            Some(spawn_watcher(&config.on_demand_capture))
+        } else {
+            None
+        };
+        let on_demand_endpoint_input = config.on_demand_capture.endpoint_id.clone();
         let mut app = Self {
             core,
             audio_stream: None,
@@ -527,6 +600,10 @@ impl Application for AppState {
             audio_devices,
             audio_wave: AudioWave::new(),
             connection_state: ConnectionState::Default,
+            capture_link: CaptureLinkStatus::Inactive,
+            watcher_state: WatcherState::Unknown,
+            on_demand_stream,
+            on_demand_endpoint_input,
             network_adapters,
             network_adapter,
             port_input: config.port.to_string(),
@@ -710,6 +787,32 @@ impl Application for AppState {
                     if config.auto_connect || is_adb_mode(config.connection_mode) {
                         return self.connect();
                     }
+                }
+                StreamerMsg::CaptureLink(status) => {
+                    self.capture_link = status;
+                    match status {
+                        CaptureLinkStatus::Linked => info!("on-demand capture linked"),
+                        CaptureLinkStatus::Legacy => {
+                            info!("legacy peer; on-demand capture falls back to always-on")
+                        }
+                        _ => {}
+                    }
+                }
+            },
+            AppMsg::OnDemand(update) => match update {
+                WatcherUpdate::Demand(active) => {
+                    self.watcher_state = if active {
+                        WatcherState::DemandOn
+                    } else {
+                        WatcherState::DemandOff
+                    };
+                    // The transport ignores this until the control channel is
+                    // linked; a legacy peer simply stays always-on.
+                    self.send_command(StreamerCommand::SetCaptureDemand(active));
+                }
+                WatcherUpdate::Degraded(error) => {
+                    warn!("on-demand watcher degraded ({error:?}); staying always-on");
+                    self.watcher_state = WatcherState::Degraded;
                 }
             },
             AppMsg::Device(audio_device) => {
@@ -924,6 +1027,16 @@ impl Application for AppState {
                 ConfigMsg::StartMinimized(start_minimized) => {
                     self.config.update(|s| s.start_minimized = start_minimized);
                 }
+                ConfigMsg::OnDemandEnabled(enabled) => {
+                    self.config.update(|c| c.on_demand_capture.enabled = enabled);
+                }
+                ConfigMsg::OnDemandEndpointInput(text) => {
+                    self.on_demand_endpoint_input = text;
+                }
+                ConfigMsg::OnDemandEndpointSave => {
+                    let endpoint = self.on_demand_endpoint_input.trim().to_owned();
+                    self.config.update(|c| c.on_demand_capture.endpoint_id = endpoint);
+                }
             },
             AppMsg::HideWindow => {
                 let mut effects = Vec::new();
@@ -1100,6 +1213,13 @@ impl Application for AppState {
             subscriptions.push(Subscription::run_with_id(
                 "system-tray",
                 system_tray_stream.clone().sub().map(AppMsg::SystemTray),
+            ));
+        }
+
+        if let Some(on_demand_stream) = &self.on_demand_stream {
+            subscriptions.push(Subscription::run_with_id(
+                "on-demand-watcher",
+                on_demand_stream.clone().sub().map(AppMsg::OnDemand),
             ));
         }
 
