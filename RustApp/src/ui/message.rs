@@ -5,6 +5,7 @@ use crate::{
         AppTheme, AudioEffect, AudioFormat, ChannelCount, ConnectionMode, DenoiseKind,
         NetworkAdapter, SampleRate,
     },
+    on_demand::WatcherUpdate,
     streamer::StreamerMsg,
 };
 use cosmic::iced::window;
@@ -29,6 +30,7 @@ pub enum AppMsg {
     Menu(MenuMsg),
     LinkClicked(String),
     SystemTray(SystemTrayMsg),
+    OnDemand(WatcherUpdate),
     Exit,
 }
 
@@ -60,6 +62,9 @@ pub enum ConfigMsg {
     PostAudioEffect(AudioEffect),
     TargetLatency(u32),
     TargetLatencyApply,
+    OnDemandEnabled(bool),
+    OnDemandEndpointInput(String),
+    OnDemandEndpointSave,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]

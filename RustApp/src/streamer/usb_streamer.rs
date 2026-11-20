@@ -280,7 +280,13 @@ impl StreamerTrait for UsbStreamer {
                                         Ok(message)
                                     }
                                 }
-                                None => todo!(),
+                                None => {
+                                    // Unknown oneof payload: ignore the frame
+                                    // instead of panicking. USB never carries the
+                                    // on-demand control channel.
+                                    warn!("dropping USB frame with unknown message payload");
+                                    Ok(None)
+                                }
                             }
                         }
                         Err(e) => Err(ConnectError::WriteError(WriteError::Deserializer(e))),
@@ -295,7 +301,14 @@ impl StreamerTrait for UsbStreamer {
                     }
                 }
                 None => {
-                    todo!()
+                    // USB endpoint ended: reset to listening instead of
+                    // panicking on the unknown stream end.
+                    self.is_listening = true;
+                    self.tracked_sequence = 0;
+                    Ok(Some(StreamerMsg::Listening {
+                        ip: None,
+                        port: None,
+                    }))
                 }
             },
             Err(_) => {

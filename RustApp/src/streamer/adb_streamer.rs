@@ -224,9 +224,16 @@ pub async fn new(
     port: u16,
     stream_config: AudioStream,
     keepalive: TcpKeepaliveConfig,
+    on_demand_enabled: bool,
 ) -> Result<AdbStreamer, ConnectError> {
-    let tcp_streamer =
-        tcp_streamer::new("127.0.0.1".parse().unwrap(), port, stream_config, keepalive).await?;
+    let tcp_streamer = tcp_streamer::new(
+        "127.0.0.1".parse().unwrap(),
+        port,
+        stream_config,
+        keepalive,
+        on_demand_enabled,
+    )
+    .await?;
     let port = tcp_streamer.port;
 
     let devices = get_connected_devices().await?;
@@ -277,6 +284,14 @@ impl StreamerTrait for AdbStreamer {
 
     fn set_window_visible(&mut self, visible: bool) {
         self.tcp_streamer.set_window_visible(visible)
+    }
+
+    fn set_capture_demand(&mut self, enabled: bool) {
+        self.tcp_streamer.set_capture_demand(enabled)
+    }
+
+    fn set_capture_degraded(&mut self, degraded: bool) {
+        self.tcp_streamer.set_capture_degraded(degraded)
     }
 
     fn status(&self) -> StreamerMsg {

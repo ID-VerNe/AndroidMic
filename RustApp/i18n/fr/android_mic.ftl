@@ -66,3 +66,11 @@ dark_theme = Sombre
 light_theme = Clair
 hight_contrast_dark_theme = Sombre à contraste élevé
 hight_contrast_light_theme = Clair à contraste élevé
+
+on_demand = Capture à la demande
+on_demand_enabled = Activé
+on_demand_endpoint = Point de capture
+on_demand_state_standby = En attente
+on_demand_state_capturing = Capture à la demande
+on_demand_state_degraded = Toujours actif (dégradé)
+on_demand_state_legacy = Téléphone legacy : toujours actif

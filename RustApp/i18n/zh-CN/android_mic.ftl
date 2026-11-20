@@ -76,3 +76,11 @@ stereo = 立体声
 
 clear_logs = 清空日志
 target_latency = 抖动缓冲
+
+on_demand = 按需采集
+on_demand_enabled = 启用
+on_demand_endpoint = 采集端点
+on_demand_state_standby = 按需待命
+on_demand_state_capturing = 采集中
+on_demand_state_degraded = 降级常开
+on_demand_state_legacy = 旧版不支持：常开

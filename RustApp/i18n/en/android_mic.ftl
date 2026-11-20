@@ -76,3 +76,11 @@ stereo = Stereo
 
 clear_logs = Clear logs
 target_latency = Jitter buffer
+
+on_demand = On-demand capture
+on_demand_enabled = Enabled
+on_demand_endpoint = Capture endpoint
+on_demand_state_standby = On standby
+on_demand_state_capturing = Capturing on demand
+on_demand_state_degraded = Always-on (degraded)
+on_demand_state_legacy = Legacy phone: always-on
