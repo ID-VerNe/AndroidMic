@@ -5,6 +5,7 @@ use light_enum::Values;
 use local_ip_address::local_ip;
 use serde::{Deserialize, Serialize};
 
+use crate::on_demand::OnDemandCaptureConfig;
 use crate::{fl, streamer::DEFAULT_PC_PORT};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +43,11 @@ pub struct Config {
     /// TCP keepalive parameters used by the TCP and ADB streamers
     #[serde(default)]
     pub tcp_keepalive: TcpKeepaliveConfig,
+
+    /// On-demand capture settings. Old configs without this section load with
+    /// the section's defaults via `#[serde(default)]`.
+    #[serde(default)]
+    pub on_demand_capture: OnDemandCaptureConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,6 +172,7 @@ impl Default for Config {
             start_minimized: false,
             target_latency_ms: 30,
             tcp_keepalive: Default::default(),
+            on_demand_capture: Default::default(),
         }
     }
 }
@@ -516,5 +523,56 @@ mod tcp_keepalive_tests {
             Config::default().tcp_keepalive,
             TcpKeepaliveConfig::default()
         );
+    }
+
+    fn write_temp_config(label: &str, contents: &str) -> std::path::PathBuf {
+        // Tests run in parallel threads inside one process: the filename must
+        // carry a per-test discriminator, otherwise two cases clobber the same
+        // temp file and read each other's contents.
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "android_mic_config_test_{}_{}_{n}.toml",
+            std::process::id(),
+            label
+        ));
+        std::fs::write(&path, contents).expect("write temp config");
+        path
+    }
+
+    #[test]
+    fn legacy_config_without_on_demand_section_loads_with_defaults() {
+        // A pre-on-demand TOML file must still deserialize: the missing
+        // `[on_demand_capture]` section falls back to its serde defaults.
+        let path = write_temp_config("legacy", "port = 54345\ntarget_latency_ms = 30\n");
+        let manager: zconf::ConfigManager<Config> = zconf::ConfigManager::new(&path);
+
+        assert!(manager.data().on_demand_capture.enabled);
+        assert!(manager.data().on_demand_capture.endpoint_id.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn on_demand_section_values_are_parsed() {
+        let contents = r#"
+port = 54345
+
+[on_demand_capture]
+enabled = false
+endpoint_id = "Whisper Cable"
+"#;
+        let path = write_temp_config("section", contents);
+        let manager: zconf::ConfigManager<Config> = zconf::ConfigManager::new(&path);
+
+        assert!(!manager.data().on_demand_capture.enabled);
+        assert_eq!(
+            manager.data().on_demand_capture.endpoint_id,
+            "Whisper Cable"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }
