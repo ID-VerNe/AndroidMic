@@ -9,6 +9,15 @@ const val CHECK_2 = "AndroidMic2"
 
 const val DEFAULT_PORT: Int = 54345
 
+/**
+ * Receives on-demand control messages from the PC. Only the TCP/ADB streamer supports it;
+ * the default no-op implementation keeps USB / UDP / Bluetooth unaffected.
+ */
+interface CaptureListener {
+    fun onCaptureHello(hello: CaptureMessage.Hello) {}
+    fun onCaptureControl(enabled: Boolean) {}
+}
+
 interface Streamer {
     fun connect(): Boolean
     fun disconnect(): Boolean
@@ -16,4 +25,7 @@ interface Streamer {
     fun start(audioStream: Flow<AudioPacket>, tx: Messenger)
     fun getInfo(): String
     fun isAlive(): Boolean
+
+    /** Attach the on-demand control listener. Default: unsupported, ignored. */
+    fun setCaptureListener(listener: CaptureListener) {}
 }

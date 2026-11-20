@@ -14,8 +14,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.IOException
+import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -29,8 +31,17 @@ class TcpStreamer(
 
     private var socket: Socket? = null
     private var streamJob: Job? = null
+    private var readerJob: Job? = null
+
+    // serializes every write on the socket (audio frames and the hello ack) so two frames
+    // can't interleave and corrupt the length prefix
+    private val writeLock = Any()
+    private var captureListener: CaptureListener? = null
 
     companion object {
+
+        // control frames are tiny; guard against a bogus length prefix
+        private const val MAX_CONTROL_FRAME_PAYLOAD = 1024
 
         fun wifi(
             ctx: Context,
@@ -69,6 +80,10 @@ class TcpStreamer(
         )
     }
 
+    override fun setCaptureListener(listener: CaptureListener) {
+        captureListener = listener
+    }
+
     // connect to server
     override fun connect(): Boolean {
 
@@ -88,6 +103,7 @@ class TcpStreamer(
     // stream data through socket
     override fun start(audioStream: Flow<AudioPacket>, tx: Messenger) {
         streamJob?.cancel()
+        startReader()
 
         streamJob = scope.launch {
             audioStream.collect { data ->
@@ -107,8 +123,10 @@ class TcpStreamer(
                     System.arraycopy(pack.size.toBigEndianU32(), 0, out, 0, 4)
                     System.arraycopy(pack, 0, out, 4, pack.size)
 
-                    socket!!.outputStream.write(out)
-                    socket!!.outputStream.flush()
+                    synchronized(writeLock) {
+                        socket!!.outputStream.write(out)
+                        socket!!.outputStream.flush()
+                    }
                 } catch (e: IOException) {
                     Log.d(tag, "${e.message}")
                     delay(5)
@@ -129,9 +147,15 @@ class TcpStreamer(
         } catch (e: IOException) {
             Log.d(tag, "disconnect [close]: ${e.message}")
             socket = null
+            readerJob?.cancel()
+            readerJob = null
+            streamJob?.cancel()
+            streamJob = null
             return false
         }
         socket = null
+        readerJob?.cancel()
+        readerJob = null
         streamJob?.cancel()
         streamJob = null
         Log.d(tag, "disconnect: complete")
@@ -189,5 +213,86 @@ class TcpStreamer(
         } catch (_: Exception) {
             false
         }
+    }
+
+    /**
+     * Reader coroutine for PC -> phone control frames (4-byte big-endian length +
+     * CaptureEnvelope). Started after the handshake; only TCP/ADB carry on-demand control.
+     */
+    private fun startReader() {
+        readerJob?.cancel()
+        val socket = socket ?: return
+
+        try {
+            // blocking read after the handshake; closing the socket unblocks the read and ends the loop
+            socket.soTimeout = 0
+        } catch (e: Exception) {
+            Log.d(tag, "reader: soTimeout reset failed: ${e.message}")
+        }
+
+        readerJob = scope.launch {
+            val input = socket.inputStream
+            while (isActive) {
+                val lenBuf = ByteArray(4)
+                if (!readFully(input, lenBuf)) break
+
+                val len = readBigEndianU32(lenBuf)
+                if (len <= 0 || len > MAX_CONTROL_FRAME_PAYLOAD) {
+                    Log.d(tag, "reader: unsupported control frame length $len, closing reader")
+                    break
+                }
+
+                val payload = ByteArray(len)
+                if (!readFully(input, payload)) break
+
+                val message = parseCaptureEnvelope(payload) ?: continue
+                when (message) {
+                    is CaptureMessage.Hello -> handleHello(message)
+                    is CaptureMessage.Control -> captureListener?.onCaptureControl(message.enabled)
+                }
+            }
+            Log.d(tag, "reader: stopped")
+        }
+    }
+
+    private fun handleHello(hello: CaptureMessage.Hello) {
+        if (hello.protocolVersion != CaptureMessage.PROTOCOL_VERSION) {
+            Log.d(tag, "unsupported hello protocol version ${hello.protocolVersion}, staying always-on")
+            return
+        }
+
+        val ack = buildCaptureHelloAck(hello.nonce)
+        try {
+            writeFramed(ack.toByteArray())
+        } catch (e: IOException) {
+            Log.d(tag, "ack write failed: ${e.message}")
+            return
+        }
+
+        captureListener?.onCaptureHello(hello)
+    }
+
+    private fun writeFramed(payload: ByteArray) {
+        val socket = socket ?: return
+        synchronized(writeLock) {
+            val out = frameCapturePayload(payload)
+            socket.outputStream.write(out)
+            socket.outputStream.flush()
+        }
+    }
+
+    private fun readFully(input: InputStream, buf: ByteArray): Boolean {
+        var total = 0
+        while (total < buf.size) {
+            val n = try {
+                input.read(buf, total, buf.size - total)
+            } catch (e: IOException) {
+                Log.d(tag, "reader: read failed: ${e.message}")
+                return false
+            }
+            if (n < 0) return false
+            total += n
+        }
+        return true
     }
 }
