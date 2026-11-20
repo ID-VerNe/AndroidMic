@@ -13,12 +13,29 @@ class CaptureGateTest {
     fun `unlinked gate always captures even when muted or demand false`() {
         val gate = CaptureGate(clock)
 
+        assertFalse(gate.linked)
+
         // legacy PC: mute must keep the recorder alive (silence fill lives in the manager)
         assertTrue(gate.update(muted = true))
         assertTrue(gate.isCapturing)
 
         gate.setPcEnabled(false)
         assertTrue(gate.update(muted = false))
+        assertTrue(gate.isCapturing)
+    }
+
+    @Test
+    fun `gate stays unlinked and always-on before a supported hello is processed`() {
+        // mirrors an unsupported-protocol hello: the gate must not link, legacy behavior holds
+        val gate = CaptureGate(clock)
+        assertFalse(gate.linked)
+
+        gate.setPcEnabled(false)
+        assertTrue(gate.update(muted = false))
+        assertTrue(gate.isCapturing)
+
+        gate.setPcEnabled(true)
+        assertTrue(gate.update(muted = true))
         assertTrue(gate.isCapturing)
     }
 

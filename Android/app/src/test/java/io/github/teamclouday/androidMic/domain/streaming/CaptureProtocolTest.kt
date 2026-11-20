@@ -48,11 +48,29 @@ class CaptureProtocolTest {
     }
 
     @Test
-    fun `ack nonce matches the hello nonce and rejects a mismatch`() {
+    fun `ack keeps the hello nonce and protocol version`() {
         val ack = buildCaptureHelloAck(42)
 
-        assertTrue(helloAckMatches(ack, 42))
-        assertFalse(helloAckMatches(ack, 43))
+        assertEquals(42, ack.nonce)
+        assertEquals(CaptureMessage.PROTOCOL_VERSION, ack.protocolVersion)
+        assertEquals(CaptureMessage.CAPABILITY_ON_DEMAND, ack.capabilities)
+    }
+
+    @Test
+    fun `only protocol version 1 is supported`() {
+        assertTrue(isSupportedProtocolVersion(CaptureMessage.PROTOCOL_VERSION))
+        assertFalse(isSupportedProtocolVersion(0))
+        assertFalse(isSupportedProtocolVersion(2))
+        assertFalse(isSupportedProtocolVersion(-1))
+    }
+
+    @Test
+    fun `control frame length rejects zero, negative and oversized prefixes`() {
+        assertTrue(isValidControlFrameLength(1))
+        assertTrue(isValidControlFrameLength(CaptureMessage.MAX_CONTROL_FRAME_PAYLOAD))
+        assertFalse(isValidControlFrameLength(0))
+        assertFalse(isValidControlFrameLength(-1))
+        assertFalse(isValidControlFrameLength(CaptureMessage.MAX_CONTROL_FRAME_PAYLOAD + 1))
     }
 
     @Test
