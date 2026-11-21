@@ -138,6 +138,65 @@ After setup, the virtual microphone will appear in your system's audio input dev
 
 ---
 
+## On-Demand Capture
+
+By default the phone keeps the microphone recording for the whole connection. With on-demand capture the PC watches the virtual-cable **capture** endpoint (the paired side of the playback cable AndroidMic writes to): when no application is actively recording from it, the PC tells the phone to stop capturing, and resumes it the moment an app opens the endpoint. This keeps the mic idle when nobody is listening, at the cost of a short resume delay.
+
+### PC configuration
+
+The settings live in the PC app config file (`AndroidMic.toml` under the app config directory) under the `[on_demand_capture]` section. Older config files without this section load the defaults below.
+
+```toml
+[on_demand_capture]
+# Master switch. When false the PC never negotiates on-demand capture and keeps
+# the legacy always-on behaviour. Default: true.
+enabled = true
+
+# Friendly-name substring of the virtual-cable capture endpoint to watch
+# (e.g. "CABLE Output"). Matched case-insensitively as a substring, so a short
+# hint can disambiguate several virtual cables. Empty means auto-detect the
+# default VB-Cable output ("CABLE Output"). Default: "".
+endpoint_id = ""
+```
+
+### How it works
+
+1. **Handshake**: after a WiFi (TCP) or ADB connect, the PC sends a capture hello (protocol version, capabilities, nonce, initial demand); the phone replies with a hello ack. An unsupported protocol version, or a peer that never answers the hello, stays in legacy always-on mode.
+2. **Control frames**: as the watched endpoint gains or loses active consumers, the PC sends capture control frames with the current demand state.
+3. **Silence keepalive tail**: after demand goes false, the phone keeps sending generated silence for about 1.5 s so the PC playout does not have to rebuffer; only then does it stop the recorder.
+4. **Degraded fail-open**: if the watcher cannot open or monitor the endpoint (endpoint not found, probe source unavailable, control channel breaks unexpectedly), the PC forces always-on capture end-to-end instead of cutting audio.
+5. **Legacy peers**: an old phone that does not answer the hello, or an old PC without the feature, both fall back to always-on. A muted phone takes priority: it does not capture even when the PC demands audio.
+
+### Recorder hold policies (debug-only)
+
+When capture goes idle the phone can either stop reading right away or keep the recorder warm for some time, trading idle power against resume latency. Three experimental policies exist; **the shipped default is `immediate`**. The other two are debug-only: no UI, preference key, or release build exposes them.
+
+| Policy | Idle behaviour | Resume on re-enable |
+|---|---|---|
+| `immediate` (default) | After the existing ~1.5 s silence keepalive tail, the recorder stops reading; the stopped recorder object is retained (it is not released to null). The baseline tail behaviour is unchanged. | Restart the retained recorder with `startRecording()`; a fresh `AudioRecord` is constructed only when the retained recorder was already null (rebuild failure / teardown path) |
+| `grace30s` | Keeps the recorder object retained for 30 s after the idle edge (the mic patch stays inactive during the window); after expiry the recorder is released to null. | Within the window: restart the existing recorder; after expiry: cold rebuild |
+| `always` | Holds the recorder and mic for the whole connection; idle keeps reading the mic but the gate drops audio locally and nothing is sent to the PC. | Warm, no rebuild |
+
+**Why `immediate` is the default** — PR3 real-device measurements on a single MI9 (2026-11-21; evidence bundle `pr3_lock_policy_evidence/`, metrics in `pr38_metrics.md` / `SUMMARY_REPORT.md`):
+
+1. **Lowest idle cost**: over a 10-minute idle, CPU time was immediate **4.180 s** < grace30s **6.505 s** ≪ always **37.754 s** (estimated ≈25.1 / 39.0 / 226.5 s per hour, 10 min ×6). Immediate and grace hold no `AudioIn` wakelock; always holds `Wake lock AudioIn` for 19.380 s.
+2. **Acceptable resume latency, and better than grace**: after a 30 s idle, PC-received resume median was immediate **136.5 ms** (P90 196.3 ms) vs grace30s **491.35 ms** (max 1124.4 ms); always is **10.45 ms**, but pays for it by holding the mic the whole idle time.
+3. **Smallest privacy surface**: immediate stops reading the mic on idle (idle audio track `active? false`, no wakelock); always keeps the track `active? true` for the whole idle period.
+
+**Switching policy in debug builds**: write one of `immediate` / `grace30s` / `always` (case-insensitive, trimmed) to `<externalFilesDir>/lock_policy_override.txt` — typically `/storage/emulated/0/Android/data/io.github.teamclouday.AndroidMic.debug/files/lock_policy_override.txt`. A missing, empty, or unrecognized file falls back to `immediate`. The file is read once per audio-manager construction, i.e. re-read on every new connection; after switching, force-stop the app and reconnect. The reader and parser exist only in the debug source set.
+
+**Release invisibility**: `src/main` holds only the stable strategy seam and the immediate implementation; `src/release` and `src/nightly` each compile an immediate-only factory, and all policy enum / controller / override code lives in `src/debug`. A string scan of the release APK dex finds zero debug-only symbols (`CaptureLockPolicy`, `RecorderHoldController`, `DebugHoldStrategy`, `LockPolicyOverride`, …); release and nightly builds never compile the experimental policies.
+
+### Limitations
+
+- **Transport**: the on-demand control channel only exists on WiFi (TCP) and USB ADB. USB Serial, UDP, and the removed Bluetooth path keep the legacy always-on behaviour.
+- **Exclusive mode**: the watcher monitors shared WASAPI sessions on the capture endpoint. If another application holds the virtual-cable endpoint exclusively, or the endpoint exposes no shareable session, the watcher cannot see consumers and degrades to fail-open always-on.
+- **Platform**: the probe source is Windows-only; on other platforms the feature degrades to always-on.
+- **grace30s after a 30 s idle is a cold rebuild**: once the 30 s warm window has expired, resume goes through cold recorder init — measured median 491.35 ms, worse than immediate's 136.5 ms. The in-window warm reuse (199.2 ms, single sample) only applies to reconnects inside the same 30 s window of one connection. Recorder objects are never reused across connections; every reconnect cold-starts.
+- **No auto-reconnect**: if the PC goes offline or restarts, the phone does not reconnect on its own; tap Connect manually (measured E2E C3).
+
+---
+
 ## Troubleshooting
 
 ### Can't hear audio / No microphone detected

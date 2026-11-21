@@ -93,6 +93,11 @@ class MicAudioManager(
     // wall-clock deadline until which generated silence keeps flowing after capture goes idle
     private var keepaliveUntilMs = 0L
 
+    // per-variant recorder hold strategy: immediate in release, experimental
+    // grace/always policies in debug (resolved by the source-set-specific factory)
+    private val holdStrategy: RecorderHoldStrategy =
+        provideHoldStrategy({ System.currentTimeMillis() }, ctx)
+
     // true when the unprocessed source was requested but the device can't provide it
     var isUnprocessedFallback = false
         private set
@@ -191,6 +196,7 @@ class MicAudioManager(
                 val capturing = gate.update(isMuted)
 
                 if (capturing) {
+                    holdStrategy.onActive()
                     keepaliveUntilMs = 0L
                     setCapturing(true)
 
@@ -202,32 +208,8 @@ class MicAudioManager(
                         continue
                     }
 
-                    val readCount: Int // number of samples read (for float) or number of bytes read (for int)
-                    val packetBuffer: ByteArray
-
-                    if (audioFormat == AudioFormat.ENCODING_PCM_FLOAT) {
-                        readCount =
-                            rec.read(bufferFloat, 0, bufferFloat.size, AudioRecord.READ_BLOCKING)
-
-                        if (readCount > 0) {
-                            bufferFloatConvert.clear()
-                            bufferFloatConvert.asFloatBuffer().put(bufferFloat, 0, readCount)
-                            packetBuffer = bufferFloatConvert.array().copyOf(readCount * 4)
-                        } else {
-                            packetBuffer = ByteArray(0)
-                        }
-                    } else {
-                        readCount = rec.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
-
-                        if (readCount > 0) {
-                            packetBuffer = ByteArray(readCount)
-                            buffer.copyInto(packetBuffer, 0, 0, readCount)
-                        } else {
-                            packetBuffer = ByteArray(0)
-                        }
-                    }
-
-                    if (readCount <= 0) {
+                    val packetBuffer = readPacket(rec)
+                    if (packetBuffer == null) {
                         delay(RECORD_DELAY_MS)
                         continue
                     }
@@ -247,19 +229,49 @@ class MicAudioManager(
                         )
                     )
                 } else {
-                    // idle: don't block on read, keep the TCP stream alive
-                    setCapturing(false)
-
                     val now = System.currentTimeMillis()
-                    if (wasCapturing) {
-                        keepaliveUntilMs = now + SILENCE_KEEPALIVE_MS
-                    }
+                    holdStrategy.onIdle(now)
 
-                    if (now < keepaliveUntilMs) {
-                        send(silencePacket())
+                    if (holdStrategy.holdsOpenWhenIdle()) {
+                        // hold the recorder open for the whole connection: keep reading the mic
+                        // but drop the packet locally, the gate already withheld audio from the PC
+                        setCapturing(true)
+
+                        val rec = recorder
+                        if (rec == null || rec.state != AudioRecord.STATE_INITIALIZED ||
+                            rec.recordingState != AudioRecord.RECORDSTATE_RECORDING
+                        ) {
+                            delay(RECORD_DELAY_MS)
+                            continue
+                        }
+
+                        if (readPacket(rec) == null) {
+                            delay(RECORD_DELAY_MS)
+                            continue
+                        }
                         delay(CHUNK_MS.toLong())
                     } else {
-                        delay(RECORD_DELAY_MS)
+                        // idle: don't block on read, keep the TCP stream alive
+                        setCapturing(false)
+
+                        if (wasCapturing) {
+                            keepaliveUntilMs = now + SILENCE_KEEPALIVE_MS
+                        }
+
+                        if (now < keepaliveUntilMs) {
+                            send(silencePacket())
+                            delay(CHUNK_MS.toLong())
+                        } else {
+                            // strategies that release after their idle window drop the
+                            // recorder here; immediate keeps the baseline retention after the tail
+                            val decision = holdStrategy.evaluate(now, keepaliveUntilMs)
+                            if (decision == HoldDecision.Release &&
+                                holdStrategy.releasesRecorderWhenIdle()
+                            ) {
+                                releaseIdleRecorder()
+                            }
+                            delay(RECORD_DELAY_MS)
+                        }
                     }
                 }
 
@@ -358,6 +370,44 @@ class MicAudioManager(
         } catch (e: Exception) {
             Log.e(TAG, "recorder rebuild failed: ${e.message}; throttled retry, fail-open")
         }
+    }
+
+    /** Read one chunk from [rec]; null when the read failed or returned no samples. */
+    private fun readPacket(rec: AudioRecord): ByteArray? {
+        val readCount: Int // number of samples read (for float) or number of bytes read (for int)
+        val packetBuffer: ByteArray
+
+        if (audioFormat == AudioFormat.ENCODING_PCM_FLOAT) {
+            readCount =
+                rec.read(bufferFloat, 0, bufferFloat.size, AudioRecord.READ_BLOCKING)
+
+            if (readCount > 0) {
+                bufferFloatConvert.clear()
+                bufferFloatConvert.asFloatBuffer().put(bufferFloat, 0, readCount)
+                packetBuffer = bufferFloatConvert.array().copyOf(readCount * 4)
+            } else {
+                packetBuffer = ByteArray(0)
+            }
+        } else {
+            readCount = rec.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
+
+            if (readCount > 0) {
+                packetBuffer = ByteArray(readCount)
+                buffer.copyInto(packetBuffer, 0, 0, readCount)
+            } else {
+                packetBuffer = ByteArray(0)
+            }
+        }
+
+        return if (readCount > 0) packetBuffer else null
+    }
+
+    /** Release the idle recorder and its effects; the next active edge rebuilds cold. */
+    private fun releaseIdleRecorder() {
+        effects.forEach { runCatching { it.release() } }
+        effects = emptyList()
+        recorder?.let { runCatching { it.release() } }
+        recorder = null
     }
 
     // shutdown manager
