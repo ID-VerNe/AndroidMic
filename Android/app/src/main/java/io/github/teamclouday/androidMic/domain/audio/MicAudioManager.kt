@@ -93,9 +93,10 @@ class MicAudioManager(
     // wall-clock deadline until which generated silence keeps flowing after capture goes idle
     private var keepaliveUntilMs = 0L
 
-    // debug-only recorder hold policy (release always resolves to IMMEDIATE)
-    private val lockPolicy = LockPolicySelector.policy
-    private val holdController = RecorderHoldController(lockPolicy)
+    // per-variant recorder hold strategy: immediate in release, experimental
+    // grace/always policies in debug (resolved by the source-set-specific factory)
+    private val holdStrategy: RecorderHoldStrategy =
+        provideHoldStrategy({ System.currentTimeMillis() }, ctx)
 
     // true when the unprocessed source was requested but the device can't provide it
     var isUnprocessedFallback = false
@@ -195,7 +196,7 @@ class MicAudioManager(
                 val capturing = gate.update(isMuted)
 
                 if (capturing) {
-                    holdController.onDemandActive()
+                    holdStrategy.onActive()
                     keepaliveUntilMs = 0L
                     setCapturing(true)
 
@@ -228,9 +229,10 @@ class MicAudioManager(
                         )
                     )
                 } else {
-                    holdController.onDemandIdle()
+                    val now = System.currentTimeMillis()
+                    holdStrategy.onIdle(now)
 
-                    if (lockPolicy == CaptureLockPolicy.ALWAYS) {
+                    if (holdStrategy.holdsOpenWhenIdle()) {
                         // hold the recorder open for the whole connection: keep reading the mic
                         // but drop the packet locally, the gate already withheld audio from the PC
                         setCapturing(true)
@@ -252,7 +254,6 @@ class MicAudioManager(
                         // idle: don't block on read, keep the TCP stream alive
                         setCapturing(false)
 
-                        val now = System.currentTimeMillis()
                         if (wasCapturing) {
                             keepaliveUntilMs = now + SILENCE_KEEPALIVE_MS
                         }
@@ -261,11 +262,11 @@ class MicAudioManager(
                             send(silencePacket())
                             delay(CHUNK_MS.toLong())
                         } else {
-                            // grace mode releases the recorder once its window has expired;
-                            // immediate keeps the baseline retention behaviour after the tail
-                            val decision = holdController.update(keepaliveUntilMs)
+                            // strategies that release after their idle window drop the
+                            // recorder here; immediate keeps the baseline retention after the tail
+                            val decision = holdStrategy.evaluate(now, keepaliveUntilMs)
                             if (decision == HoldDecision.Release &&
-                                lockPolicy == CaptureLockPolicy.GRACE_30S
+                                holdStrategy.releasesRecorderWhenIdle()
                             ) {
                                 releaseIdleRecorder()
                             }

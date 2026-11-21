@@ -76,7 +76,6 @@ android {
     buildFeatures {
         prefab = true
         compose = true
-        buildConfig = true
     }
 
     lint {

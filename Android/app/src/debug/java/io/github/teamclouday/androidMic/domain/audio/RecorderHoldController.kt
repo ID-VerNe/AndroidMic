@@ -1,29 +1,26 @@
 package io.github.teamclouday.androidMic.domain.audio
 
 /**
- * Pure-JVM recorder-hold decision machine for the on-demand lock policies.
+ * Pure-JVM recorder-hold decision machine for the experimental debug policies.
  *
  * Mirrors [CaptureGate]: no `android.*` imports, clock injected, all mutations
  * synchronized. The capture loop reports demand edges; [update] answers whether the
  * recorder / mic lock should stay held and whether the retained recorder can be reused
  * warm on the next active edge.
  *
- * State:
- * - [held] — recorder / mic lock is still retained (not released).
- * - [reusable] — the retained recorder instance can be restarted without a cold rebuild;
- *   false after a release, so the next active edge rebuilds the recorder from scratch.
+ * Debug source set only; release builds use [ImmediateHoldStrategy] instead.
  */
 class RecorderHoldController(
     val policy: CaptureLockPolicy,
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) {
 
-    /** recorder / mic lock currently retained (not released). */
+    /** Recorder / mic lock currently retained (not released). */
     @Volatile
     var held: Boolean = true
         private set
 
-    /** retained recorder can be reused on the next active edge without rebuild. */
+    /** Retained recorder can be reused on the next active edge without rebuild. */
     @Volatile
     var reusable: Boolean = true
         private set
@@ -79,7 +76,7 @@ class RecorderHoldController(
         val now = clock()
         if (demandActive) {
             held = true
-            return HoldDecision.Hold(reusable = reusable)
+            return HoldDecision.Hold(reusable)
         }
 
         when (policy) {
@@ -127,14 +124,4 @@ class RecorderHoldController(
         reusable = false
         graceUntilMs = null
     }
-}
-
-/** Outcome of a hold decision. */
-sealed interface HoldDecision {
-
-    /** Recorder retained; [reusable] means the next active edge can restart it without rebuild. */
-    data class Hold(val reusable: Boolean) : HoldDecision
-
-    /** Recorder released; the next active edge must rebuild it cold. */
-    data object Release : HoldDecision
 }
