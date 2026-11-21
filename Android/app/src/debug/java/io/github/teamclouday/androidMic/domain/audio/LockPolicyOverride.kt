@@ -29,14 +29,19 @@ class LockPolicyOverrideSource(
     companion object {
         const val FILE_NAME = "lock_policy_override.txt"
 
-        fun fromContext(context: Context?): LockPolicyOverrideSource {
-            val file: File? = context?.getExternalFilesDir(null)?.resolve(FILE_NAME)
-            return LockPolicyOverrideSource {
-                try {
-                    file?.takeIf { it.exists() }?.readText()
-                } catch (_: Exception) {
-                    null
-                }
+        fun fromContext(context: Context?): LockPolicyOverrideSource =
+            fromFile(context?.getExternalFilesDir(null)?.resolve(FILE_NAME))
+
+        /**
+         * Wraps a file whose missing state or read failure resolves to `null`
+         * (then to [CaptureLockPolicy.IMMEDIATE]). Internal so the file/exception
+         * branch can be exercised from the pure-JVM unit tests.
+         */
+        internal fun fromFile(file: File?): LockPolicyOverrideSource = LockPolicyOverrideSource {
+            try {
+                file?.takeIf { it.exists() }?.readText()
+            } catch (_: Exception) {
+                null
             }
         }
     }

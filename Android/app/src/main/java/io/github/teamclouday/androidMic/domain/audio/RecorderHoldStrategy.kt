@@ -12,7 +12,12 @@ interface RecorderHoldStrategy {
     /** Recorder / mic lock currently retained (not released). */
     val held: Boolean
 
-    /** Retained recorder can be reused on the next active edge without rebuild. */
+    /**
+     * Whether the retained recorder can be reused warm on the next active edge.
+     * Advisory metadata computed by the strategy; the capture loop decides reuse
+     * from whether the recorder object is still retained (`recorder != null`) and
+     * does not read this flag directly.
+     */
     val reusable: Boolean
 
     /** Demand edge: the PC wants audio again (or the link opened enabled). */

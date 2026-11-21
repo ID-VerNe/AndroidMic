@@ -169,23 +169,23 @@ endpoint_id = ""
 
 ### Recorder hold policies (debug-only)
 
-When capture goes idle the phone can either release the recorder right away or keep it warm for some time, trading idle power against resume latency. Three experimental policies exist; **the shipped default is `immediate`**. The other two are debug-only: no UI, preference key, or release build exposes them.
+When capture goes idle the phone can either stop reading right away or keep the recorder warm for some time, trading idle power against resume latency. Three experimental policies exist; **the shipped default is `immediate`**. The other two are debug-only: no UI, preference key, or release build exposes them.
 
 | Policy | Idle behaviour | Resume on re-enable |
 |---|---|---|
-| `immediate` (default) | Releases the recorder after the existing ~1.5 s silence keepalive tail; the next demand edge cold-starts a fresh recorder. The baseline tail behaviour is unchanged. | Cold rebuild |
-| `grace30s` | Keeps the recorder object retained for 30 s after the idle edge (the mic patch stays inactive during the window). | Within the window: restart the existing recorder; after expiry: cold rebuild |
+| `immediate` (default) | After the existing ~1.5 s silence keepalive tail, the recorder stops reading; the stopped recorder object is retained (it is not released to null). The baseline tail behaviour is unchanged. | Restart the retained recorder with `startRecording()`; a fresh `AudioRecord` is constructed only when the retained recorder was already null (rebuild failure / teardown path) |
+| `grace30s` | Keeps the recorder object retained for 30 s after the idle edge (the mic patch stays inactive during the window); after expiry the recorder is released to null. | Within the window: restart the existing recorder; after expiry: cold rebuild |
 | `always` | Holds the recorder and mic for the whole connection; idle keeps reading the mic but the gate drops audio locally and nothing is sent to the PC. | Warm, no rebuild |
 
 **Why `immediate` is the default** — PR3 real-device measurements on a single MI9 (2026-11-21; evidence bundle `pr3_lock_policy_evidence/`, metrics in `pr38_metrics.md` / `SUMMARY_REPORT.md`):
 
 1. **Lowest idle cost**: over a 10-minute idle, CPU time was immediate **4.180 s** < grace30s **6.505 s** ≪ always **37.754 s** (estimated ≈25.1 / 39.0 / 226.5 s per hour, 10 min ×6). Immediate and grace hold no `AudioIn` wakelock; always holds `Wake lock AudioIn` for 19.380 s.
 2. **Acceptable resume latency, and better than grace**: after a 30 s idle, PC-received resume median was immediate **136.5 ms** (P90 196.3 ms) vs grace30s **491.35 ms** (max 1124.4 ms); always is **10.45 ms**, but pays for it by holding the mic the whole idle time.
-3. **Smallest privacy surface**: immediate releases the mic on idle (idle audio track `active? false`, no wakelock); always keeps the track `active? true` for the whole idle period.
+3. **Smallest privacy surface**: immediate stops reading the mic on idle (idle audio track `active? false`, no wakelock); always keeps the track `active? true` for the whole idle period.
 
 **Switching policy in debug builds**: write one of `immediate` / `grace30s` / `always` (case-insensitive, trimmed) to `<externalFilesDir>/lock_policy_override.txt` — typically `/storage/emulated/0/Android/data/io.github.teamclouday.AndroidMic.debug/files/lock_policy_override.txt`. A missing, empty, or unrecognized file falls back to `immediate`. The file is read once per audio-manager construction, i.e. re-read on every new connection; after switching, force-stop the app and reconnect. The reader and parser exist only in the debug source set.
 
-**Release invisibility**: `src/main` holds only the stable strategy seam and the immediate implementation; `src/release` compiles an immediate-only factory, and all policy enum / controller / override code lives in `src/debug`. A string scan of the release APK dex finds zero debug-only symbols (`CaptureLockPolicy`, `RecorderHoldController`, `DebugHoldStrategy`, `LockPolicyOverride`, …); release builds never compile the experimental policies.
+**Release invisibility**: `src/main` holds only the stable strategy seam and the immediate implementation; `src/release` and `src/nightly` each compile an immediate-only factory, and all policy enum / controller / override code lives in `src/debug`. A string scan of the release APK dex finds zero debug-only symbols (`CaptureLockPolicy`, `RecorderHoldController`, `DebugHoldStrategy`, `LockPolicyOverride`, …); release and nightly builds never compile the experimental policies.
 
 ### Limitations
 

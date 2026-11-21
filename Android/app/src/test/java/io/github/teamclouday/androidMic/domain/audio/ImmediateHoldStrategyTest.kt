@@ -28,7 +28,7 @@ class ImmediateHoldStrategyTest {
     }
 
     @Test
-    fun `re-enable after release needs a cold rebuild`() {
+    fun `active edge after the tail reports non-reusable at the strategy level`() {
         val strategy = ImmediateHoldStrategy()
         strategy.onIdle(now = 0L)
         strategy.evaluate(now = 5_000L, tailUntilMs = 1_500L)

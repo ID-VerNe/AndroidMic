@@ -111,7 +111,12 @@ class RecorderHoldController(
         }
     }
 
-    /** Drop all hold state after a disconnect / reset. */
+    /**
+     * Drop all hold state after a disconnect / reset. Not wired to the production
+     * path: the audio manager (and this controller) is rebuilt per connection, so
+     * there is no cross-connection state to clear. Kept for tests and a future
+     * symmetric teardown if the controller ever outlives a connection.
+     */
     fun reset() = synchronized(this) {
         demandActive = true
         graceUntilMs = null

@@ -24,6 +24,11 @@ class LockPolicyOverrideParserTest {
     }
 
     @Test
+    fun `utf-8 bom prefix makes the value unrecognized`() {
+        assertEquals(CaptureLockPolicy.IMMEDIATE, LockPolicyOverrideParser.parse("\uFEFFalways"))
+    }
+
+    @Test
     fun `valid values parse case-insensitively with trimming`() {
         assertEquals(CaptureLockPolicy.IMMEDIATE, LockPolicyOverrideParser.parse("immediate"))
         assertEquals(CaptureLockPolicy.GRACE_30S, LockPolicyOverrideParser.parse("grace30s"))

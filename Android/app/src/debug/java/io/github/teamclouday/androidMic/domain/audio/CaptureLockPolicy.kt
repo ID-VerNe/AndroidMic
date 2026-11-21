@@ -8,8 +8,9 @@ package io.github.teamclouday.androidMic.domain.audio
 enum class CaptureLockPolicy {
 
     /**
-     * Stop capture after the silence keepalive tail; the next demand edge cold-starts
-     * a fresh recorder. Matches the shipped immediate behaviour.
+     * Stop reading after the silence keepalive tail; the stopped recorder object is
+     * retained and the next demand edge resumes it (`startRecording`) instead of
+     * rebuilding a fresh AudioRecord. Matches the shipped immediate behaviour.
      */
     IMMEDIATE,
 
