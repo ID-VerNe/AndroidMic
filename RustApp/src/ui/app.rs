@@ -175,6 +175,19 @@ fn capture_cmds(prev: Option<CaptureCmdState>, next: CaptureCmdState) -> Vec<Str
     }
 }
 
+/// Commands to push for `next`, honouring the duplicate filter unless `force`.
+///
+/// `force` is used by the Ready-time replay: the previous push may have been
+/// dropped while the transport was not ready, so even an unchanged value has to
+/// be re-sent.
+fn capture_cmds_for(
+    sent: Option<CaptureCmdState>,
+    next: CaptureCmdState,
+    force: bool,
+) -> Vec<StreamerCommand> {
+    capture_cmds(if force { None } else { sent }, next)
+}
+
 /// Four on-demand UI states shown in the main window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnDemandView {
@@ -355,14 +368,16 @@ impl AppState {
     /// The watcher emits a snapshot every ~100 ms; without this filter each tick
     /// produced two commands (and two info-level lines) even when nothing changed.
     fn apply_capture_state(&mut self, force: bool) {
+        // Before Ready every send is dropped (and logged): skip the attempt and
+        // let `replay_capture_state` deliver the state once the sender exists.
+        if !force && self.streamer.is_none() {
+            return;
+        }
+
         let Some(next) = capture_target(self.watcher_state) else {
             return;
         };
-        let cmds = if force {
-            capture_cmds(None, next)
-        } else {
-            capture_cmds(self.capture_cmd_sent, next)
-        };
+        let cmds = capture_cmds_for(self.capture_cmd_sent, next, force);
         if cmds.is_empty() {
             return;
         }
@@ -506,6 +521,9 @@ impl AppState {
         self.audio_stream = None;
         self.audio_wave.clear();
         self.capture_link = CaptureLinkStatus::Inactive;
+        // The next session starts on a fresh streamer; `connect()` resets this
+        // as well, keep both paths identical.
+        self.capture_cmd_sent = None;
 
         self.sync_tray();
 
@@ -1563,6 +1581,17 @@ mod capture_cmd_tests {
             .collect()
     }
 
+    fn cmds_for(
+        sent: Option<CaptureCmdState>,
+        next: CaptureCmdState,
+        force: bool,
+    ) -> Vec<String> {
+        capture_cmds_for(sent, next, force)
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect()
+    }
+
     #[test]
     fn unknown_watcher_state_pushes_nothing() {
         assert_eq!(capture_target(WatcherState::Unknown), None);
@@ -1580,11 +1609,13 @@ mod capture_cmd_tests {
     }
 
     #[test]
-    fn replay_after_ready_emits_the_full_set_again() {
-        // force path: the previous push may have been dropped, so a matching
-        // value must still be replayed
+    fn force_ignores_the_duplicate_filter() {
+        // Ready-time replay: the previous push may have been dropped, so an
+        // unchanged value still has to reach the transport
+        let state = target(WatcherState::DemandOff);
+        assert!(cmds_for(Some(state), state, false).is_empty());
         assert_eq!(
-            cmds(None, target(WatcherState::DemandOff)),
+            cmds_for(Some(state), state, true),
             vec![
                 "SetCaptureDegraded(false)".to_string(),
                 "SetCaptureDemand(false)".to_string()
