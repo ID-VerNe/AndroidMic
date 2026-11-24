@@ -233,6 +233,9 @@ class MainViewModel : ViewModel() {
 
             Log.d(TAG, "auto connect gave up after ${AutoConnectPolicy.attemptCount} attempts")
             pendingAutoConnect = false
+            // Drop the explicit request too, otherwise a later manual Connect
+            // would be licensed to start without the toggle on.
+            explicitAutoConnectRequest = false
         }
     }
 
@@ -255,7 +258,11 @@ class MainViewModel : ViewModel() {
         }
 
         viewModelScope.launch {
-            lanIp?.let { prefs.ip.update(it) }
+            // Only fill in what is missing: a LAN address the user configured by
+            // hand wins over the one the PC happens to believe it has.
+            if (lanIp != null && AutoTransport.usableLanIp(prefs.ip.get()) == null) {
+                prefs.ip.update(lanIp)
+            }
             port?.let { prefs.port.update(it.toString()) }
             explicitAutoConnectRequest = true
             pendingAutoConnect = true

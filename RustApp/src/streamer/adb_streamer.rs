@@ -114,12 +114,19 @@ pub(crate) async fn probe_devices() -> Result<Vec<AdbDevice>, ConnectError> {
     Ok(classify_devices(&output))
 }
 
-/// Every serial able to accept `adb reverse` (wired, wireless and emulators).
+/// Every serial able to accept `adb reverse`. `ConnectionMode::Adb` deliberately
+/// keeps emulators: a tunnel to an emulator is legitimate, and this PR must not
+/// narrow a transport it does not own.
 async fn get_connected_devices() -> Result<Vec<String>, ConnectError> {
     Ok(probe_devices()
         .await?
         .into_iter()
-        .filter(|device| device.kind == DeviceKind::Wired || device.kind == DeviceKind::Wireless)
+        .filter(|device| {
+            matches!(
+                device.kind,
+                DeviceKind::Wired | DeviceKind::Wireless | DeviceKind::Emulator
+            )
+        })
         .map(|device| device.serial)
         .collect())
 }

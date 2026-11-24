@@ -238,7 +238,7 @@ fn connection_type(app: &AppState) -> Element<'_, AppMsg> {
             .push(
                 radio(
                     text(fl!("connection_auto")),
-                    &true,
+                    true,
                     Some(auto),
                     |_| AppMsg::ChangeConnectionMode(ConnectionMode::Auto),
                 )
@@ -248,7 +248,7 @@ fn connection_type(app: &AppState) -> Element<'_, AppMsg> {
             .push(
                 radio(
                     text(fl!("connection_manual")),
-                    &false,
+                    false,
                     Some(auto),
                     move |_| AppMsg::ChangeConnectionMode(manual_mode),
                 )
@@ -260,32 +260,32 @@ fn connection_type(app: &AppState) -> Element<'_, AppMsg> {
         let mut manual = column().spacing(5).padding([0, 20]);
         manual = manual.push(radio(
             text(fl!("connection_tcp")),
-            &ConnectionMode::Tcp,
+            ConnectionMode::Tcp,
             Some(connection_mode),
-            |mode| AppMsg::ChangeConnectionMode(*mode),
+            AppMsg::ChangeConnectionMode,
         ));
         manual = manual.push(radio(
             text(fl!("connection_udp")),
-            &ConnectionMode::Udp,
+            ConnectionMode::Udp,
             Some(connection_mode),
-            |mode| AppMsg::ChangeConnectionMode(*mode),
+            AppMsg::ChangeConnectionMode,
         ));
         #[cfg(feature = "usb")]
         {
             manual = manual.push(radio(
                 text(fl!("connection_usb")),
-                &ConnectionMode::Usb,
+                ConnectionMode::Usb,
                 Some(connection_mode),
-                |mode| AppMsg::ChangeConnectionMode(*mode),
+                AppMsg::ChangeConnectionMode,
             ));
         }
         #[cfg(feature = "adb")]
         {
             manual = manual.push(radio(
                 text(fl!("connection_adb")),
-                &ConnectionMode::Adb,
+                ConnectionMode::Adb,
                 Some(connection_mode),
-                |mode| AppMsg::ChangeConnectionMode(*mode),
+                AppMsg::ChangeConnectionMode,
             ));
         }
         modes = modes.push(manual);

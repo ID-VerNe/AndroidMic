@@ -248,11 +248,15 @@ class TcpStreamer(
                 delay(AutoTransport.RECONNECT_DELAY_MS)
 
                 for (candidate in AutoTransport.candidates(fallbackIp)) {
+                    // `createSocket` and `handShake` block; a user disconnect or a
+                    // newer reconnect must not end up with a socket nobody owns.
+                    if (!isActive) return@launch
+
                     val newSocket =
                         createSocket(candidate, port, AutoTransport.CONNECT_TIMEOUT_MS)
                             ?: continue
 
-                    if (!handShake(newSocket)) {
+                    if (!isActive || !handShake(newSocket)) {
                         closeQuietly(newSocket)
                         continue
                     }
@@ -264,9 +268,11 @@ class TcpStreamer(
                 }
             }
 
+            if (!isActive) return@launch
+
             Log.d(tag, "auto reconnect gave up after ${AutoTransport.RECONNECT_WINDOW_MS} ms")
             teardownStream()
-            tx.send(CommandData(Command.StopStream).toCommandMsg())
+            runCatching { tx.send(CommandData(Command.StopStream).toCommandMsg()) }
         }
     }
 
@@ -348,10 +354,11 @@ class TcpStreamer(
                 }
             }
 
-            // An explicit disconnect nulls the socket; if it is still set the reader broke
-            // unexpectedly, so fail the control channel open instead of freezing the gate
-            // at its last state.
-            if (failure != null && this@TcpStreamer.socket != null) {
+            // An explicit disconnect nulls the socket; if it is still the one this
+            // reader was bound to, the reader broke unexpectedly, so fail the control
+            // channel open instead of freezing the gate at its last state. A
+            // reconnect replaces the socket, and the old reader must not fire this.
+            if (failure != null && this@TcpStreamer.socket === socket) {
                 Log.w(tag, "reader: control channel closed unexpectedly (${failure}); failing open")
                 captureListener?.onCaptureChannelClosed()
             }

@@ -215,6 +215,18 @@ fn is_adb_mode(mode: ConnectionMode) -> bool {
     }
 }
 
+/// Whether the mode is the automatic policy. Only `Auto` can lose the wired
+/// path while staying connected, so only it gets the transition message.
+#[cfg(feature = "adb")]
+fn is_auto_mode(mode: ConnectionMode) -> bool {
+    matches!(mode, ConnectionMode::Auto)
+}
+
+#[cfg(not(feature = "adb"))]
+fn is_auto_mode(_mode: ConnectionMode) -> bool {
+    false
+}
+
 /// The manual transport to restore when the user leaves `Automatic`. `Auto`
 /// itself is a policy over transports, so it is never a manual choice.
 fn manual_mode_of(mode: ConnectionMode) -> ConnectionMode {
@@ -923,7 +935,11 @@ impl Application for AppState {
                     // A cable pull shows up as a drop to `Listening` while the
                     // wildcard listener stays up; say so once, next to the log
                     // line the phone's own fallback produces.
-                    let lost_wired_path = self.live_path == Some(TransportPath::Wired)
+                    // Only `Automatic` can lose the wired path while the app
+                    // keeps listening; a manual transport dropping is a plain
+                    // disconnect and must not claim a fallback is happening.
+                    let lost_wired_path = is_auto_mode(config.connection_mode)
+                        && self.live_path == Some(TransportPath::Wired)
                         && self.connection_state == ConnectionState::Connected;
 
                     if let Some(audio_stream) = self.audio_stream.as_ref() {

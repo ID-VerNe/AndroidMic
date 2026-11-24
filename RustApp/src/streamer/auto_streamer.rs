@@ -109,7 +109,22 @@ fn spawn_device_watch(port: u16, fallback_ip: Option<IpAddr>) -> JoinHandle<()> 
                             Ok(false) => {
                                 info!("adb reverse tunnel missing for {serial}; rebuilding");
                                 match ensure_reverse_proxy(serial, port).await {
-                                    Ok(()) => device_note = None,
+                                    Ok(()) => {
+                                        device_note = None;
+                                        // The tunnel coming back does not mean the
+                                        // phone is still streaming: an adb server
+                                        // restart took the app down with it.
+                                        if let Err(e) =
+                                            launch_android_app(serial, fallback_ip, port).await
+                                        {
+                                            note_once(
+                                                &mut device_note,
+                                                format!(
+                                                    "can't auto-start AndroidMic on {serial}: {e}"
+                                                ),
+                                            );
+                                        }
+                                    }
                                     Err(e) => note_once(
                                         &mut device_note,
                                         format!("can't rebuild adb reverse tunnel: {e}"),
@@ -225,6 +240,12 @@ impl StreamerTrait for AutoStreamer {
                 port,
                 mode: ConnectionMode::Auto,
                 path,
+            },
+            // The bind is wildcard, so the raw address is `0.0.0.0`; the
+            // address worth logging is the one the phone dials next.
+            StreamerMsg::Listening { port, .. } => StreamerMsg::Listening {
+                ip: self.fallback_ip,
+                port,
             },
             other => other,
         }))
