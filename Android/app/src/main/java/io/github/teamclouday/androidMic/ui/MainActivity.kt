@@ -32,6 +32,13 @@ class MainActivity : ComponentActivity() {
          * wake the app and ask it to start the ADB stream.
          */
         const val EXTRA_AUTO_CONNECT = "io.github.teamclouday.androidMic.extra.AUTO_CONNECT"
+
+        /**
+         * LAN address and port the PC pushes with the launch intent, so an
+         * `AUTO` phone can fall back to Wi-Fi without a manual IP entry.
+         */
+        const val EXTRA_PC_IP = "io.github.teamclouday.androidMic.extra.PC_IP"
+        const val EXTRA_PC_PORT = "io.github.teamclouday.androidMic.extra.PC_PORT"
     }
 
     val vm: MainViewModel by viewModels()
@@ -54,7 +61,10 @@ class MainActivity : ComponentActivity() {
 
         if (intent?.getBooleanExtra(EXTRA_AUTO_CONNECT, false) == true) {
             Log.d(TAG, "onCreate -> auto connect extra")
-            vm.requestAutoConnect()
+            vm.requestAutoConnect(
+                pcIp = intent.getStringExtra(EXTRA_PC_IP),
+                pcPort = intent.getIntExtra(EXTRA_PC_PORT, -1)
+            )
         }
 
         setContent {
@@ -75,7 +85,10 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         if (intent.getBooleanExtra(EXTRA_AUTO_CONNECT, false)) {
             Log.d(TAG, "onNewIntent -> auto connect extra")
-            vm.requestAutoConnect()
+            vm.requestAutoConnect(
+                pcIp = intent.getStringExtra(EXTRA_PC_IP),
+                pcPort = intent.getIntExtra(EXTRA_PC_PORT, -1)
+            )
         }
         if (intent.extras?.getBoolean("ForegroundServiceBound") == true) {
             Log.d(TAG, "onNewIntent -> ForegroundServiceBound")

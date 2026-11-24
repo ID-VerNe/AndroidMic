@@ -25,6 +25,12 @@ class MicStreamManager(
             TcpStreamer.adb(scope, port!!)
         }
 
+        // Loopback tunnel first, configured LAN address as the fallback; a
+        // blank LAN address is the documented USB-only state.
+        Mode.AUTO -> {
+            TcpStreamer.auto(scope, ip, port!!)
+        }
+
         Mode.USB -> {
             UsbStreamer(ctx, scope)
         }
