@@ -15,7 +15,7 @@ audio_format = Format audio
 denoise = Réduction du bruit
 
 start_at_login = Démarrer à la connexion  
-auto_connect = Connexion automatique
+auto_connect = Connexion au démarrage
 theme = Thème
 
 main_window_title = AndroidMic  
@@ -74,3 +74,14 @@ on_demand_state_standby = En attente
 on_demand_state_capturing = Capture à la demande
 on_demand_state_degraded = Toujours actif (dégradé)
 on_demand_state_legacy = Téléphone legacy : toujours actif
+
+connection_auto = Automatique
+connection_auto_hint = USB quand le câble est branché, Wi-Fi sinon
+connection_manual = Choisir manuellement
+fallback_address = Adresse de repli
+fallback_address_hint = Utilisée quand le câble est débranché
+path_usb = USB
+path_wifi = Wi-Fi { $ip }
+state_connected_path = Connecté · { $path }
+listening_auto_hint = En écoute — en attente du téléphone en USB ou en Wi-Fi. Le téléphone doit aussi être en mode Automatique.
+usb_link_lost = Liaison USB perdue, reconnexion en Wi-Fi…

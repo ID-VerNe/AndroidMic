@@ -1,7 +1,4 @@
-use std::{
-    fmt::{Debug, Display},
-    net::{IpAddr, Ipv4Addr},
-};
+use std::fmt::{Debug, Display};
 
 use cpal::{
     Device, Host,
@@ -38,7 +35,10 @@ use crate::{
     },
     fl, single_instance,
     on_demand::{WatcherStream, WatcherUpdate, spawn_watcher},
-    streamer::{self, CaptureLinkStatus, ConnectOption, DEFAULT_PC_PORT, StreamerCommand, StreamerMsg},
+    streamer::{
+        self, CaptureLinkStatus, ConnectOption, DEFAULT_PC_PORT, StreamerCommand, StreamerMsg,
+        TransportPath,
+    },
     ui::view::{SCROLLABLE_ID, about_window},
     utils::APP_ID,
     window_icon,
@@ -201,15 +201,27 @@ pub enum OnDemandView {
     Legacy,
 }
 
+/// Whether the mode carries the on-demand control channel over a TCP-ish
+/// transport. `Auto` does: it is the same `TcpStreamer` on a wildcard socket.
 fn is_adb_mode(mode: ConnectionMode) -> bool {
     #[cfg(feature = "adb")]
     {
-        matches!(mode, ConnectionMode::Adb)
+        matches!(mode, ConnectionMode::Adb | ConnectionMode::Auto)
     }
     #[cfg(not(feature = "adb"))]
     {
         let _ = mode;
         false
+    }
+}
+
+/// The manual transport to restore when the user leaves `Automatic`. `Auto`
+/// itself is a policy over transports, so it is never a manual choice.
+fn manual_mode_of(mode: ConnectionMode) -> ConnectionMode {
+    match mode {
+        #[cfg(feature = "adb")]
+        ConnectionMode::Auto => ConnectionMode::Tcp,
+        other => other,
     }
 }
 
@@ -292,6 +304,12 @@ pub struct AppState {
     pub audio_stream: Option<Stream>,
     pub audio_wave: AudioWave,
     pub connection_state: ConnectionState,
+    /// Transport the live connection actually arrived on (USB tunnel vs LAN),
+    /// as reported by the transport, not read from the config.
+    pub live_path: Option<TransportPath>,
+    /// Last explicitly chosen manual transport, restored when the user leaves
+    /// `Automatic`. Kept separate so the policy choice does not erase it.
+    pub manual_mode: ConnectionMode,
     /// On-demand negotiation state reported by the transport.
     pub capture_link: CaptureLinkStatus,
     /// Latest demand from the PC session watcher.
@@ -395,6 +413,7 @@ impl AppState {
     /// gone or its command channel broke.
     fn reset_stream_state(&mut self) {
         self.connection_state = ConnectionState::Default;
+        self.live_path = None;
         self.audio_stream = None;
         self.audio_wave.clear();
         self.capture_link = CaptureLinkStatus::Inactive;
@@ -492,6 +511,21 @@ impl AppState {
                 keepalive: config.tcp_keepalive,
                 on_demand_enabled: config.on_demand_capture.enabled,
             },
+            #[cfg(feature = "adb")]
+            ConnectionMode::Auto => {
+                let fallback_ip = config.ip.or_else(|| local_ip_address::local_ip().ok());
+                if fallback_ip.is_none() {
+                    warn!(
+                        "no LAN address available: the phone can only reach this PC over USB"
+                    );
+                }
+                ConnectOption::Auto {
+                    port: config.port,
+                    keepalive: config.tcp_keepalive,
+                    on_demand_enabled: config.on_demand_capture.enabled,
+                    fallback_ip,
+                }
+            }
             #[cfg(feature = "usb")]
             ConnectionMode::Usb => ConnectOption::Usb,
         };
@@ -518,6 +552,7 @@ impl AppState {
     fn disconnect(&mut self) -> Task<AppMsg> {
         let _ = self.send_command(StreamerCommand::Stop);
         self.connection_state = ConnectionState::Default;
+        self.live_path = None;
         self.audio_stream = None;
         self.audio_wave.clear();
         self.capture_link = CaptureLinkStatus::Inactive;
@@ -530,16 +565,34 @@ impl AppState {
         Task::none()
     }
 
+    /// Status line shared by the main window, the tray menu and the tray
+    /// tooltip. While connected it names the live transport, because with
+    /// `Automatic` the config no longer says which path audio is taking.
+    pub fn status_text(&self) -> String {
+        match self.connection_state {
+            ConnectionState::Default => fl!("state_disconnected"),
+            ConnectionState::WaitingOnStatus => fl!("waiting"),
+            ConnectionState::Listening => fl!("state_listening"),
+            ConnectionState::Connected => match self.live_path {
+                Some(TransportPath::Wired) => {
+                    let path = fl!("path_usb");
+                    fl!("state_connected_path", path = path)
+                }
+                Some(TransportPath::Lan(ip)) => {
+                    let ip = ip.to_string();
+                    let path = fl!("path_wifi", ip = ip);
+                    fl!("state_connected_path", path = path)
+                }
+                None => fl!("state_connected"),
+            },
+        }
+    }
+
     /// Sync the tray menu with `connection_state`, the single source of truth
     /// shared with the main window.
     fn sync_tray(&mut self) {
         let menu_state = tray_menu_state(self.connection_state);
-        let status = match self.connection_state {
-            ConnectionState::Default => fl!("state_disconnected"),
-            ConnectionState::WaitingOnStatus => fl!("waiting"),
-            ConnectionState::Listening => fl!("state_listening"),
-            ConnectionState::Connected => fl!("state_connected"),
-        };
+        let status = self.status_text();
         let stop_label = match menu_state.action {
             TrayAction::StopListening => fl!("tray_stop_listening"),
             _ => fl!("tray_disconnect"),
@@ -722,6 +775,8 @@ impl Application for AppState {
             audio_devices,
             audio_wave: AudioWave::new(),
             connection_state: ConnectionState::Default,
+            live_path: None,
+            manual_mode: manual_mode_of(config.connection_mode),
             capture_link: CaptureLinkStatus::Inactive,
             watcher_state: WatcherState::Unknown,
             capture_cmd_sent: None,
@@ -803,6 +858,17 @@ impl Application for AppState {
                     config.connection_mode = connection_mode;
                 });
 
+                // Coming back from `Automatic` must restore the transport the
+                // user last chose by hand, not a hardcoded default.
+                #[cfg(feature = "adb")]
+                if !matches!(connection_mode, ConnectionMode::Auto) {
+                    self.manual_mode = connection_mode;
+                }
+                #[cfg(not(feature = "adb"))]
+                {
+                    self.manual_mode = connection_mode;
+                }
+
                 // A mode change while Listening/Connected/WaitingOnStatus must
                 // not leave the old streamer alive. Otherwise the old mode keeps
                 // its listener (ADB binds 127.0.0.1 and installs `adb reverse`),
@@ -847,12 +913,19 @@ impl Application for AppState {
             AppMsg::Streamer(streamer_msg) => match streamer_msg {
                 StreamerMsg::Error(e) => {
                     self.connection_state = ConnectionState::Default;
+                    self.live_path = None;
                     self.audio_stream = None;
                     self.audio_wave.clear();
                     self.sync_tray();
                     return self.add_log(&e);
                 }
                 StreamerMsg::Listening { ip, port } => {
+                    // A cable pull shows up as a drop to `Listening` while the
+                    // wildcard listener stays up; say so once, next to the log
+                    // line the phone's own fallback produces.
+                    let lost_wired_path = self.live_path == Some(TransportPath::Wired)
+                        && self.connection_state == ConnectionState::Connected;
+
                     if let Some(audio_stream) = self.audio_stream.as_ref() {
                         if let Err(e) = audio_stream.stream.pause() {
                             error!("{e}");
@@ -861,30 +934,49 @@ impl Application for AppState {
                     self.audio_wave.clear();
 
                     self.connection_state = ConnectionState::Listening;
+                    self.live_path = None;
                     self.sync_tray();
+
+                    if lost_wired_path {
+                        info!("USB link lost, waiting for the phone to reconnect over Wi-Fi");
+                    }
+
                     if let (Some(ip), Some(port)) = (ip, port) {
                         info!("listening on {ip}:{port}");
-                        return self.add_log(format!("Listening on `{ip}:{port}`").as_str());
+                        let mut log = format!("Listening on `{ip}:{port}`");
+                        if lost_wired_path {
+                            log.push_str("\n\n");
+                            log.push_str(&fl!("usb_link_lost"));
+                        }
+                        return self.add_log(&log);
+                    }
+
+                    if lost_wired_path {
+                        return self.add_log(&fl!("usb_link_lost"));
                     }
                 }
-                StreamerMsg::Connected { ip, port, mode: _ } => {
+                StreamerMsg::Connected {
+                    ip: _,
+                    port: _,
+                    mode: _,
+                    path,
+                } => {
                     if let Some(audio_stream) = self.audio_stream.as_ref() {
                         if let Err(e) = audio_stream.stream.play() {
                             error!("{e}");
                         }
                     }
 
-                    if !self.main_window_visible() {
-                        let address = format!(
-                            "{}:{}",
-                            ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-                            port.unwrap_or_default()
-                        );
+                    self.connection_state = ConnectionState::Connected;
+                    self.live_path = path;
+                    self.sync_tray();
+                    let status = self.status_text();
 
+                    if !self.main_window_visible() {
                         // show notification when app is minimized
                         let _ = Notification::new()
                             .summary("AndroidMic")
-                            .body(format!("Connected on {address}").as_str())
+                            .body(status.as_str())
                             .auto_icon()
                             .show()
                             .map_err(|e| {
@@ -892,12 +984,8 @@ impl Application for AppState {
                             });
                     }
 
-                    self.connection_state = ConnectionState::Connected;
-                    self.sync_tray();
-                    if let (Some(ip), Some(port)) = (ip, port) {
-                        info!("connected on {ip}:{port}");
-                        return self.add_log(format!("Connected on `{ip}:{port}`").as_str());
-                    }
+                    info!("{status}");
+                    return self.add_log(&status);
                 }
                 StreamerMsg::UpdateAudioWave { data } => {
                     self.audio_wave.write_chunk(&data);
@@ -1672,5 +1760,31 @@ mod capture_cmd_tests {
     fn degraded_repeat_is_dropped() {
         let state = target(WatcherState::Degraded);
         assert!(cmds(Some(state), state).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod auto_mode_tests {
+    use super::*;
+
+    #[cfg(feature = "adb")]
+    #[test]
+    fn auto_mode_carries_the_capture_control_channel() {
+        // `Auto` is the same TCP streamer on a wildcard socket, so the on-demand
+        // gate and the startup auto-listen must treat it like `Adb`, not like
+        // UDP/USB.
+        assert!(is_adb_mode(ConnectionMode::Auto));
+        assert!(!is_adb_mode(ConnectionMode::Tcp));
+        assert!(!is_adb_mode(ConnectionMode::Udp));
+    }
+
+    #[cfg(feature = "adb")]
+    #[test]
+    fn leaving_auto_restores_the_last_manual_transport() {
+        assert_eq!(manual_mode_of(ConnectionMode::Auto), ConnectionMode::Tcp);
+        assert_eq!(manual_mode_of(ConnectionMode::Udp), ConnectionMode::Udp);
+        #[cfg(feature = "usb")]
+        assert_eq!(manual_mode_of(ConnectionMode::Usb), ConnectionMode::Usb);
+        assert_eq!(manual_mode_of(ConnectionMode::Adb), ConnectionMode::Adb);
     }
 }
