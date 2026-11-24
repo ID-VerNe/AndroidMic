@@ -43,6 +43,7 @@
 
     <string name="microphone_not_recording">Le microphone n\'enregistre pas</string>
     <string name="connected_device">Appareil connecté:\n</string>
+    <!-- Ligne d'état de la capture à la demande, au-dessus du journal -->
     <string name="capture_state_legacy">PC (ancienne version) : capture permanente</string>
     <string name="capture_state_standby">En veille à la demande : micro fermé</string>
     <string name="capture_state_capturing">Capture en cours : micro ouvert</string>

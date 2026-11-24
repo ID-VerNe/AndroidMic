@@ -50,6 +50,7 @@
     <string name="microphone_not_recording">麦克风没有在录制</string>
 
     <string name="connected_device">已连接设备:\n</string>
+    <!-- 日志上方的按需采集状态行 -->
     <string name="capture_state_legacy">旧版 PC：常开采集</string>
     <string name="capture_state_standby">按需待命：麦克风已关闭</string>
     <string name="capture_state_capturing">采集中：麦克风已打开</string>

@@ -55,6 +55,7 @@
     <string name="microphone_not_recording">Microphone is not recording</string>
 
     <string name="connected_device">Connected Device:\n</string>
+    <!-- Pinned on-demand capture status line, shown above the log -->
     <string name="capture_state_legacy">PC (legacy): always-on capture</string>
     <string name="capture_state_standby">On-demand standby: microphone closed</string>
     <string name="capture_state_capturing">Capturing: microphone open</string>
