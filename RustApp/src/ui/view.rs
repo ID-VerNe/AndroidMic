@@ -9,7 +9,7 @@ use cosmic::{
     },
     widget::{
         self, about::About, button, canvas, column, container, context_menu, horizontal_space,
-        markdown, menu, radio, row, scrollable, settings, text, toggler, tooltip, vertical_space,
+        markdown, menu, radio, row, scrollable, settings, text, toggler, tooltip,
     },
 };
 use cpal::traits::DeviceTrait;
@@ -45,16 +45,22 @@ pub fn main_window(app: &AppState) -> Element<'_, AppMsg> {
                 .push(wave(app)),
         )
         .push(
-            column()
-                .width(Length::FillPortion(1))
-                .height(Length::Fill)
-                .spacing(20)
-                .align_x(Horizontal::Center)
-                .push_maybe(uses_lan(connection_mode).then(|| network_adapter(app)))
-                .push(audio(app))
-                .push(vertical_space())
-                .push_maybe(app.on_demand_view().map(on_demand_status))
-                .push(connection_type(app)),
+            // The settings column is taller than the default 800x600 window once
+            // the connection-type hints are in it, and a plain `column` clips its
+            // tail: the Connect button and the status line became unreachable.
+            // Scroll it so every control stays reachable at any window size.
+            scrollable(
+                column()
+                    .width(Length::Fill)
+                    .spacing(20)
+                    .align_x(Horizontal::Center)
+                    .push_maybe(uses_lan(connection_mode).then(|| network_adapter(app)))
+                    .push(audio(app))
+                    .push_maybe(app.on_demand_view().map(on_demand_status))
+                    .push(connection_type(app)),
+            )
+            .width(Length::FillPortion(1))
+            .height(Length::Fill),
         )
         .into()
 }
