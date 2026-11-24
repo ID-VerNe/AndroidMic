@@ -95,7 +95,12 @@ class CaptureGate(
     private var offDeadlineMs: Long? = null
     private var demandFalseSinceMs: Long? = null
 
-    /** Hello processed: on-demand mode is active. The hello's initial demand is not a rising edge. */
+    /**
+     * Hello processed: on-demand mode is active. The hello's initial demand is not a rising edge.
+     *
+     * The published [state] is not recomputed here: the capture loop calls [update]
+     * right after the handshake, and only that call knows the current mute flag.
+     */
     fun link(initialEnabled: Boolean) = synchronized(this) {
         linked = true
         pcEnabled = initialEnabled

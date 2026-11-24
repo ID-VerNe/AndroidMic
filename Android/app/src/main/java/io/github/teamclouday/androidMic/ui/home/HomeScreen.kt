@@ -208,6 +208,7 @@ private fun Log(
                 style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier
                     .weight(1f)
+                    .fillMaxWidth()
                     .verticalScroll(ScrollState(Int.MAX_VALUE))
                     .padding(15.dp)
             )

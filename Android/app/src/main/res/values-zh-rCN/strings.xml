@@ -53,7 +53,7 @@
     <string name="capture_state_legacy">旧版 PC：常开采集</string>
     <string name="capture_state_standby">按需待命：麦克风已关闭</string>
     <string name="capture_state_capturing">采集中：麦克风已打开</string>
-    <string name="capture_state_muted">已静音</string>
+    <string name="capture_state_muted">已静音：麦克风已关闭</string>
     <string name="mic_start_recording">麦克风已启动录制</string>
     <string name="unprocessed_not_supported">此设备不支持未处理音频源，已改用语音识别</string>
 

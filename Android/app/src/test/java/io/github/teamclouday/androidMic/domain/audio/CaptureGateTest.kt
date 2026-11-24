@@ -227,6 +227,7 @@ class CaptureGateStateTest {
         gate.setPcEnabled(true)
         gate.update(muted = false)
         assertEquals(CaptureGate.State.Capturing, seen.last())
+        assertEquals(3, seen.size)
 
         // demand off flips back after the debounce window
         gate.setPcEnabled(false)
@@ -271,5 +272,33 @@ class CaptureGateStateTest {
 
         assertEquals(CaptureGate.State.Legacy, gate.state)
         assertEquals(listOf(CaptureGate.State.Legacy), seen)
+    }
+
+    @Test
+    fun `unlinked gate never reports muted`() {
+        val gate = CaptureGate(clock)
+        val seen = mutableListOf<CaptureGate.State>()
+        gate.onStateChanged = { seen.add(it) }
+
+        // legacy PC: mute keeps the recorder alive, so the UI must not claim the
+        // mic is closed while it is still capturing
+        assertTrue(gate.update(muted = true))
+        assertEquals(CaptureGate.State.Legacy, gate.state)
+        assertTrue(seen.isEmpty())
+    }
+
+    @Test
+    fun `reset from muted republishes legacy`() {
+        val gate = CaptureGate(clock)
+        val seen = mutableListOf<CaptureGate.State>()
+        gate.onStateChanged = { seen.add(it) }
+
+        gate.link(initialEnabled = true)
+        gate.update(muted = true)
+        assertEquals(CaptureGate.State.Muted, gate.state)
+
+        gate.reset()
+        assertEquals(CaptureGate.State.Legacy, gate.state)
+        assertEquals(listOf(CaptureGate.State.Muted, CaptureGate.State.Legacy), seen)
     }
 }

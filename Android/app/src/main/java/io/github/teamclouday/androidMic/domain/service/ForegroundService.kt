@@ -106,6 +106,8 @@ class ForegroundService : Service() {
 
     // This field is true if the UI is running
     private var isBind = false
+    /** Written on the service handler thread, read from the capture loop. */
+    @Volatile
     private var uiMessenger: Messenger? = null
 
 
@@ -456,6 +458,16 @@ class ForegroundService : Service() {
     private fun getStatus(replyTo: Messenger) {
         Log.d(TAG, "getStatus")
 
-        reply(replyTo, ResponseData(isConnected = states.isStreamStarted, isMuted = states.isMuted))
+        reply(
+            replyTo,
+            ResponseData(
+                isConnected = states.isStreamStarted,
+                isMuted = states.isMuted,
+                // Included here as well: pushes are dropped while the UI is
+                // unbound, so a rebind would otherwise keep showing the state
+                // from before the app went to the background.
+                captureState = captureGate?.state,
+            )
+        )
     }
 }

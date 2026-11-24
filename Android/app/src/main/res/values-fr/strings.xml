@@ -43,10 +43,10 @@
 
     <string name="microphone_not_recording">Le microphone n\'enregistre pas</string>
     <string name="connected_device">Appareil connecté:\n</string>
-    <string name="capture_state_legacy">PC (legacy) : capture permanente</string>
-    <string name="capture_state_standby">En attente à la demande : micro fermé</string>
+    <string name="capture_state_legacy">PC (ancienne version) : capture permanente</string>
+    <string name="capture_state_standby">En veille à la demande : micro fermé</string>
     <string name="capture_state_capturing">Capture en cours : micro ouvert</string>
-    <string name="capture_state_muted">Micro coupé</string>
+    <string name="capture_state_muted">Micro coupé : capture en pause</string>
     <string name="mic_start_recording">Le microphone a commencé à enregister</string>
     <string name="unprocessed_not_supported">La source audio non traitée n\'est pas prise en charge par cet appareil, utilisation de la reconnaissance vocale</string>
 
