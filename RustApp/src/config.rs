@@ -277,23 +277,51 @@ pub struct Args {
     Debug,
     Clone,
     Copy,
-    Default,
     PartialEq,
     Eq,
     strum::Display,
     strum::EnumString,
-    serde_with::DeserializeFromStr,
     Serialize,
 )]
 #[strum(ascii_case_insensitive)]
 pub enum ConnectionMode {
-    #[default]
     Tcp,
     Udp,
     #[cfg(feature = "adb")]
     Adb,
     #[cfg(feature = "usb")]
     Usb,
+    /// Pick the transport from the live plug state: a wired `adb` device gets
+    /// the loopback tunnel, everything else arrives over the LAN, on one
+    /// wildcard listener.
+    #[cfg(feature = "adb")]
+    Auto,
+}
+
+impl Default for ConnectionMode {
+    fn default() -> Self {
+        // New configs start on the plug-and-play path; existing configs keep
+        // their stored value because `Config` is deserialized field by field.
+        #[cfg(feature = "adb")]
+        {
+            ConnectionMode::Auto
+        }
+        #[cfg(not(feature = "adb"))]
+        {
+            ConnectionMode::Tcp
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConnectionMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // An unknown value (a mode written by a newer build, or a hand-edited
+        // TOML) must not fail the whole config: `zconf` replaces the entire
+        // file with defaults when any field fails to parse.
+        let raw = String::deserialize(deserializer)?;
+        let mode: ConnectionMode = raw.parse().unwrap_or_default();
+        Ok(mode)
+    }
 }
 
 #[derive(
@@ -574,6 +602,65 @@ endpoint_id = "Whisper Cable"
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "adb")]
+    #[test]
+    fn auto_mode_is_persisted_and_reloaded() {
+        let contents = "connection_mode = \"Auto\"\nport = 54345\n";
+        let path = write_temp_config("auto-mode", contents);
+        let manager: zconf::ConfigManager<Config> = zconf::ConfigManager::new(&path);
+
+        assert_eq!(manager.data().connection_mode, ConnectionMode::Auto);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "adb")]
+    #[test]
+    fn auto_mode_is_case_insensitive_on_load() {
+        let contents = "connection_mode = \"aUtO\"\n";
+        let path = write_temp_config("auto-mode-case", contents);
+        let manager: zconf::ConfigManager<Config> = zconf::ConfigManager::new(&path);
+
+        assert_eq!(manager.data().connection_mode, ConnectionMode::Auto);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unknown_mode_keeps_the_rest_of_the_config() {
+        // A mode written by a newer build (or a hand-edited TOML) must not make
+        // `zconf` replace the whole file with defaults: every other setting has
+        // to survive an unparsable enum value.
+        let contents = "connection_mode = \"Carrier Pigeon\"\nport = 50000\n";
+        let path = write_temp_config("unknown-mode", contents);
+        let manager: zconf::ConfigManager<Config> = zconf::ConfigManager::new(&path);
+
+        assert_eq!(manager.data().connection_mode, ConnectionMode::default());
+        assert_eq!(manager.data().port, 50000);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn existing_manual_modes_still_parse() {
+        for (raw, expected) in [
+            ("Tcp", ConnectionMode::Tcp),
+            ("Udp", ConnectionMode::Udp),
+            #[cfg(feature = "adb")]
+            ("Adb", ConnectionMode::Adb),
+            #[cfg(feature = "usb")]
+            ("Usb", ConnectionMode::Usb),
+        ] {
+            let contents = format!("connection_mode = \"{raw}\"\n");
+            let path = write_temp_config("legacy-mode", &contents);
+            let manager: zconf::ConfigManager<Config> = zconf::ConfigManager::new(&path);
+
+            assert_eq!(manager.data().connection_mode, expected, "mode {raw}");
+
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

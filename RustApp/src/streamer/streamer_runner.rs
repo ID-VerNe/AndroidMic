@@ -34,8 +34,29 @@ pub enum ConnectOption {
         keepalive: TcpKeepaliveConfig,
         on_demand_enabled: bool,
     },
+    /// One wildcard listener for both paths: `adb reverse` for a wired device,
+    /// the LAN for everything else.
+    #[cfg(feature = "adb")]
+    Auto {
+        port: u16,
+        keepalive: TcpKeepaliveConfig,
+        on_demand_enabled: bool,
+        /// LAN address handed to the phone so it can fall back after an unplug.
+        fallback_ip: Option<IpAddr>,
+    },
     #[cfg(feature = "usb")]
     Usb,
+}
+
+/// The transport an accepted connection actually arrived on. Reported from the
+/// live peer address, not from the configured mode, so the status line stays
+/// correct when the path changes under a fixed config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportPath {
+    /// USB cable via the `adb reverse` tunnel.
+    Wired,
+    /// Wi-Fi / LAN peer at this address.
+    Lan(IpAddr),
 }
 
 /// On-demand capture negotiation state reported by the transport.
@@ -151,6 +172,8 @@ pub enum StreamerMsg {
         ip: Option<IpAddr>,
         port: Option<u16>,
         mode: ConnectionMode,
+        /// Live transport of this connection, when the streamer knows it.
+        path: Option<TransportPath>,
     },
     Ready(Sender<StreamerCommand>),
     /// On-demand capture negotiation result for the current connection.
@@ -237,6 +260,23 @@ pub fn sub() -> impl Stream<Item = StreamerMsg> {
                                                 stream_config,
                                                 keepalive,
                                                 on_demand_enabled,
+                                            )
+                                            .await
+                                            .map(Streamer::from)
+                                        }
+                                        #[cfg(feature = "adb")]
+                                        ConnectOption::Auto {
+                                            port,
+                                            keepalive,
+                                            on_demand_enabled,
+                                            fallback_ip,
+                                        } => {
+                                            crate::streamer::auto_streamer::new(
+                                                port,
+                                                stream_config,
+                                                keepalive,
+                                                on_demand_enabled,
+                                                fallback_ip,
                                             )
                                             .await
                                             .map(Streamer::from)

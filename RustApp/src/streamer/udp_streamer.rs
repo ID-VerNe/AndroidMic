@@ -84,6 +84,7 @@ impl StreamerTrait for UdpStreamer {
                 ip: Some(self.ip),
                 port: Some(self.port),
                 mode: ConnectionMode::Udp,
+                path: None,
             }
         }
     }
@@ -183,6 +184,7 @@ impl StreamerTrait for UdpStreamer {
                                             ip: Some(self.ip),
                                             port: Some(self.port),
                                             mode: ConnectionMode::Udp,
+                                            path: None,
                                         }))
                                     } else {
                                         Ok(message)
