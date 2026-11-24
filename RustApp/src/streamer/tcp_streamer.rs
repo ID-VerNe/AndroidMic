@@ -171,6 +171,8 @@ pub async fn new(
 
     let addr = TcpListener::local_addr(&listener).map_err(ConnectError::NoLocalAddress)?;
 
+    info!("TCP server listening on {addr}");
+
     info!(
         "tcp keepalive configured: time={}s interval={}s retries={}",
         keepalive.time_duration().as_secs(),
@@ -249,11 +251,6 @@ impl StreamerTrait for TcpStreamer {
     async fn next(&mut self) -> Result<Option<StreamerMsg>, ConnectError> {
         let outcome = match &mut self.state {
             TcpStreamerState::Listening { listener } => {
-                let addr =
-                    TcpListener::local_addr(listener).map_err(ConnectError::NoLocalAddress)?;
-
-                info!("TCP server listening on {}", addr);
-
                 let (mut stream, addr) =
                     listener.accept().await.map_err(ConnectError::CantAccept)?;
 
@@ -520,6 +517,13 @@ impl TcpStreamer {
                 Ok(listener) => {
                     self.process_cache.clear();
                     self.state = TcpStreamerState::Listening { listener };
+
+                    info!(
+                        "TCP server listening on {}:{} after {} rebind attempt(s)",
+                        self.ip,
+                        self.port,
+                        attempts + 1
+                    );
 
                     return Ok(Some(StreamerMsg::Listening {
                         ip: Some(self.ip),
