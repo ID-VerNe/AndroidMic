@@ -136,6 +136,58 @@ pub enum WatcherState {
     Degraded,
 }
 
+/// Last capture state handed to the transport, used to drop duplicate pushes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureCmdState {
+    /// Probe source unavailable: fail open to always-on capture.
+    Degraded,
+    /// Healthy watcher snapshot with the given demand.
+    Demand(bool),
+}
+
+/// Map a watcher state onto the capture state the transport should be in.
+/// `Unknown` means "no snapshot yet", so nothing is pushed.
+fn capture_target(state: WatcherState) -> Option<CaptureCmdState> {
+    match state {
+        WatcherState::Unknown => None,
+        WatcherState::Degraded => Some(CaptureCmdState::Degraded),
+        WatcherState::DemandOn => Some(CaptureCmdState::Demand(true)),
+        WatcherState::DemandOff => Some(CaptureCmdState::Demand(false)),
+    }
+}
+
+/// Commands needed to move the transport to `next`.
+///
+/// `prev == None` always emits the full set: either nothing was pushed yet, or
+/// the previous push was dropped and has to be replayed. The order
+/// (`Degraded` first, then `Demand`) matches what the runner expects: a healthy
+/// snapshot clears a previous degradation before applying the demand.
+fn capture_cmds(prev: Option<CaptureCmdState>, next: CaptureCmdState) -> Vec<StreamerCommand> {
+    if prev == Some(next) {
+        return Vec::new();
+    }
+    match next {
+        CaptureCmdState::Degraded => vec![StreamerCommand::SetCaptureDegraded(true)],
+        CaptureCmdState::Demand(enabled) => vec![
+            StreamerCommand::SetCaptureDegraded(false),
+            StreamerCommand::SetCaptureDemand(enabled),
+        ],
+    }
+}
+
+/// Commands to push for `next`, honouring the duplicate filter unless `force`.
+///
+/// `force` is used by the Ready-time replay: the previous push may have been
+/// dropped while the transport was not ready, so even an unchanged value has to
+/// be re-sent.
+fn capture_cmds_for(
+    sent: Option<CaptureCmdState>,
+    next: CaptureCmdState,
+    force: bool,
+) -> Vec<StreamerCommand> {
+    capture_cmds(if force { None } else { sent }, next)
+}
+
 /// Four on-demand UI states shown in the main window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnDemandView {
@@ -244,6 +296,8 @@ pub struct AppState {
     pub capture_link: CaptureLinkStatus,
     /// Latest demand from the PC session watcher.
     pub watcher_state: WatcherState,
+    /// Capture state already delivered to the current streamer.
+    capture_cmd_sent: Option<CaptureCmdState>,
     /// Dedicated watcher thread stream, when the feature is enabled.
     pub on_demand_stream: Option<WatcherStream>,
     /// Endpoint-name text input buffer (settings window).
@@ -302,21 +356,38 @@ impl AppState {
     /// Called once the streamer sender becomes available, so an update that
     /// arrived before Ready (and would have been dropped by the ready guard)
     /// still reaches the current streamer; the runner additionally caches and
-    /// replays this state onto the next Connect.
+    /// replays this state onto the next Connect. The replay bypasses the
+    /// duplicate filter, because the previous command may have been dropped
+    /// while the sender was not ready.
     fn replay_capture_state(&mut self) {
-        match self.watcher_state {
-            WatcherState::Degraded => {
-                self.send_command(StreamerCommand::SetCaptureDegraded(true));
-            }
-            WatcherState::DemandOn => {
-                self.send_command(StreamerCommand::SetCaptureDegraded(false));
-                self.send_command(StreamerCommand::SetCaptureDemand(true));
-            }
-            WatcherState::DemandOff => {
-                self.send_command(StreamerCommand::SetCaptureDegraded(false));
-                self.send_command(StreamerCommand::SetCaptureDemand(false));
-            }
-            WatcherState::Unknown => {}
+        self.apply_capture_state(true);
+    }
+
+    /// Push the watcher state to the transport, skipping consecutive duplicates.
+    ///
+    /// The watcher emits a snapshot every ~100 ms; without this filter each tick
+    /// produced two commands (and two info-level lines) even when nothing changed.
+    fn apply_capture_state(&mut self, force: bool) {
+        // Before Ready every send is dropped (and logged): skip the attempt and
+        // let `replay_capture_state` deliver the state once the sender exists.
+        if !force && self.streamer.is_none() {
+            return;
+        }
+
+        let Some(next) = capture_target(self.watcher_state) else {
+            return;
+        };
+        let cmds = capture_cmds_for(self.capture_cmd_sent, next, force);
+        if cmds.is_empty() {
+            return;
+        }
+
+        let mut delivered = true;
+        for cmd in cmds {
+            delivered &= self.send_command(cmd);
+        }
+        if delivered {
+            self.capture_cmd_sent = Some(next);
         }
     }
 
@@ -327,6 +398,7 @@ impl AppState {
         self.audio_stream = None;
         self.audio_wave.clear();
         self.capture_link = CaptureLinkStatus::Inactive;
+        self.capture_cmd_sent = None;
         self.sync_tray();
     }
 
@@ -426,6 +498,9 @@ impl AppState {
 
         self.connection_state = ConnectionState::WaitingOnStatus;
         self.sync_tray();
+        // A fresh streamer starts empty: the first watcher snapshot must always
+        // be delivered, even if the value matches the previous connection.
+        self.capture_cmd_sent = None;
 
         if !self.send_command(StreamerCommand::Connect {
             connect_options,
@@ -446,6 +521,9 @@ impl AppState {
         self.audio_stream = None;
         self.audio_wave.clear();
         self.capture_link = CaptureLinkStatus::Inactive;
+        // The next session starts on a fresh streamer; `connect()` resets this
+        // as well, keep both paths identical.
+        self.capture_cmd_sent = None;
 
         self.sync_tray();
 
@@ -646,6 +724,7 @@ impl Application for AppState {
             connection_state: ConnectionState::Default,
             capture_link: CaptureLinkStatus::Inactive,
             watcher_state: WatcherState::Unknown,
+            capture_cmd_sent: None,
             on_demand_stream,
             on_demand_endpoint_input,
             network_adapters,
@@ -858,9 +937,9 @@ impl Application for AppState {
                     // A healthy snapshot clears any previous degradation, then
                     // the debounced demand applies. The transport ignores this
                     // until the control channel is linked; a legacy peer simply
-                    // stays always-on.
-                    self.send_command(StreamerCommand::SetCaptureDegraded(false));
-                    self.send_command(StreamerCommand::SetCaptureDemand(active));
+                    // stays always-on. Snapshots arrive every ~100 ms, so the
+                    // push is filtered: only real changes reach the transport.
+                    self.apply_capture_state(false);
                 }
                 WatcherUpdate::Degraded(error) => {
                     warn!("on-demand watcher degraded ({error:?}); forcing always-on");
@@ -869,7 +948,7 @@ impl Application for AppState {
                     // the phone must keep capturing. The degraded flag forces
                     // `Control(true)` (and a `capture_enabled=true` Hello); a
                     // later Demand snapshot clears it once the source recovers.
-                    self.send_command(StreamerCommand::SetCaptureDegraded(true));
+                    self.apply_capture_state(false);
                 }
             },
             AppMsg::Device(audio_device) => {
@@ -1482,5 +1561,116 @@ mod window_registry_tests {
         let mut slot = None;
         assert!(!clear_window(&mut slot, window::Id::unique()));
         assert!(slot.is_none());
+    }
+}
+
+#[cfg(test)]
+mod capture_cmd_tests {
+    use super::*;
+
+    fn target(state: WatcherState) -> CaptureCmdState {
+        capture_target(state).expect("watcher state must map to a capture target")
+    }
+
+    /// Compare commands by their `Debug` rendering: `StreamerCommand` carries
+    /// non-`PartialEq` payloads (playout writers, cpal params).
+    fn cmds(prev: Option<CaptureCmdState>, next: CaptureCmdState) -> Vec<String> {
+        capture_cmds(prev, next)
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect()
+    }
+
+    fn cmds_for(
+        sent: Option<CaptureCmdState>,
+        next: CaptureCmdState,
+        force: bool,
+    ) -> Vec<String> {
+        capture_cmds_for(sent, next, force)
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect()
+    }
+
+    #[test]
+    fn unknown_watcher_state_pushes_nothing() {
+        assert_eq!(capture_target(WatcherState::Unknown), None);
+    }
+
+    #[test]
+    fn first_snapshot_emits_degraded_then_demand() {
+        assert_eq!(
+            cmds(None, target(WatcherState::DemandOn)),
+            vec![
+                "SetCaptureDegraded(false)".to_string(),
+                "SetCaptureDemand(true)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn force_ignores_the_duplicate_filter() {
+        // Ready-time replay: the previous push may have been dropped, so an
+        // unchanged value still has to reach the transport
+        let state = target(WatcherState::DemandOff);
+        assert!(cmds_for(Some(state), state, false).is_empty());
+        assert_eq!(
+            cmds_for(Some(state), state, true),
+            vec![
+                "SetCaptureDegraded(false)".to_string(),
+                "SetCaptureDemand(false)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_snapshot_is_dropped() {
+        let state = target(WatcherState::DemandOff);
+        assert!(cmds(Some(state), state).is_empty());
+    }
+
+    #[test]
+    fn demand_flip_emits_both_commands() {
+        assert_eq!(
+            cmds(
+                Some(target(WatcherState::DemandOff)),
+                target(WatcherState::DemandOn)
+            ),
+            vec![
+                "SetCaptureDegraded(false)".to_string(),
+                "SetCaptureDemand(true)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn degraded_only_pushes_the_degraded_flag() {
+        assert_eq!(
+            cmds(
+                Some(target(WatcherState::DemandOn)),
+                target(WatcherState::Degraded)
+            ),
+            vec!["SetCaptureDegraded(true)".to_string()]
+        );
+    }
+
+    #[test]
+    fn recovery_from_degraded_restores_demand() {
+        assert_eq!(
+            cmds(
+                Some(target(WatcherState::Degraded)),
+                target(WatcherState::DemandOff)
+            ),
+            vec![
+                "SetCaptureDegraded(false)".to_string(),
+                "SetCaptureDemand(false)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn degraded_repeat_is_dropped() {
+        let state = target(WatcherState::Degraded);
+        assert!(cmds(Some(state), state).is_empty());
     }
 }
