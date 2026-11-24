@@ -91,6 +91,8 @@ fun DrawerBody(vm: MainViewModel) {
             DialogIpPort(
                 vm = vm,
                 expanded = dialogIpPortExpanded,
+                // AUTO needs both: port always, LAN address for the Wi-Fi
+                // fallback once the cable is pulled.
                 portOnly = mode.value == Mode.ADB
             )
             SettingsItem(
@@ -102,7 +104,7 @@ fun DrawerBody(vm: MainViewModel) {
             )
         }
 
-        if (mode.value == Mode.ADB) {
+        if (mode.value == Mode.ADB || mode.value == Mode.AUTO) {
             SettingsSwitchItem(
                 title = stringResource(R.string.auto_connect),
                 subTitle = stringResource(R.string.auto_connect_summary),

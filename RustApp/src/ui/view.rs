@@ -50,11 +50,7 @@ pub fn main_window(app: &AppState) -> Element<'_, AppMsg> {
                 .height(Length::Fill)
                 .spacing(20)
                 .align_x(Horizontal::Center)
-                .push_maybe(
-                    (connection_mode == ConnectionMode::Tcp
-                        || connection_mode == ConnectionMode::Udp)
-                        .then(|| network_adapter(app)),
-                )
+                .push_maybe(uses_lan(connection_mode).then(|| network_adapter(app)))
                 .push(audio(app))
                 .push(vertical_space())
                 .push_maybe(app.on_demand_view().map(on_demand_status))
@@ -169,12 +165,39 @@ fn audio(app: &AppState) -> Element<'_, AppMsg> {
         .into()
 }
 
+/// Whether the mode can reach the PC over the LAN, which is when the adapter
+/// choice matters. `Automatic` needs it too: the phone falls back to that
+/// address once the cable is out.
+fn uses_lan(mode: ConnectionMode) -> bool {
+    match mode {
+        ConnectionMode::Tcp | ConnectionMode::Udp => true,
+        #[cfg(feature = "adb")]
+        ConnectionMode::Auto => true,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "adb")]
+fn is_auto(mode: ConnectionMode) -> bool {
+    matches!(mode, ConnectionMode::Auto)
+}
+
+#[cfg(not(feature = "adb"))]
+fn is_auto(_mode: ConnectionMode) -> bool {
+    false
+}
+
 fn network_adapter(app: &AppState) -> Element<'_, AppMsg> {
     let selected = app.network_adapter.as_ref();
+    let auto = is_auto(app.config.data().connection_mode);
     column()
         .spacing(20)
         .align_x(Horizontal::Center)
-        .push(text::title4(fl!("network_adapter")))
+        .push(text::title4(if auto {
+            fl!("fallback_address")
+        } else {
+            fl!("network_adapter")
+        }))
         .push(
             row()
                 .width(Length::Fill)
@@ -195,64 +218,91 @@ fn network_adapter(app: &AppState) -> Element<'_, AppMsg> {
                         .width(Length::Shrink),
                 ),
         )
+        .push_maybe(auto.then(|| text::caption(fl!("fallback_address_hint"))))
         .into()
 }
 
 fn connection_type(app: &AppState) -> Element<'_, AppMsg> {
-    let connection_mode = &app.config.data().connection_mode;
+    let connection_mode = app.config.data().connection_mode;
+    let auto = is_auto(connection_mode);
+    #[cfg(feature = "adb")]
+    let manual_mode = app.manual_mode;
+
+    // Grouped by policy, not by transport: the top-level choice is an outcome
+    // ("Automatic" / "Specify manually"), the protocols only matter once the
+    // user opts out of it.
+    let mut modes = column().spacing(5);
+
+    #[cfg(feature = "adb")]
+    {
+        modes = modes
+            .push(
+                radio(
+                    text(fl!("connection_auto")),
+                    true,
+                    Some(auto),
+                    |_| AppMsg::ChangeConnectionMode(ConnectionMode::Auto),
+                )
+                .width(Length::Fill),
+            )
+            .push_maybe(auto.then(|| text::caption(fl!("connection_auto_hint"))))
+            .push(
+                radio(
+                    text(fl!("connection_manual")),
+                    false,
+                    Some(auto),
+                    move |_| AppMsg::ChangeConnectionMode(manual_mode),
+                )
+                .width(Length::Fill),
+            );
+    }
+
+    if !auto {
+        let mut manual = column().spacing(5).padding([0, 20]);
+        manual = manual.push(radio(
+            text(fl!("connection_tcp")),
+            ConnectionMode::Tcp,
+            Some(connection_mode),
+            AppMsg::ChangeConnectionMode,
+        ));
+        manual = manual.push(radio(
+            text(fl!("connection_udp")),
+            ConnectionMode::Udp,
+            Some(connection_mode),
+            AppMsg::ChangeConnectionMode,
+        ));
+        #[cfg(feature = "usb")]
+        {
+            manual = manual.push(radio(
+                text(fl!("connection_usb")),
+                ConnectionMode::Usb,
+                Some(connection_mode),
+                AppMsg::ChangeConnectionMode,
+            ));
+        }
+        #[cfg(feature = "adb")]
+        {
+            manual = manual.push(radio(
+                text(fl!("connection_adb")),
+                ConnectionMode::Adb,
+                Some(connection_mode),
+                AppMsg::ChangeConnectionMode,
+            ));
+        }
+        modes = modes.push(manual);
+    }
 
     column()
         .spacing(20)
         .align_x(Horizontal::Center)
         .push(text::title4(fl!("connection")))
-        .push(
-            column()
-                .push(radio(
-                    text(fl!("connection_tcp")),
-                    &ConnectionMode::Tcp,
-                    Some(connection_mode),
-                    |mode| AppMsg::ChangeConnectionMode(*mode),
-                ))
-                .push(radio(
-                    text(fl!("connection_udp")),
-                    &ConnectionMode::Udp,
-                    Some(connection_mode),
-                    |mode| AppMsg::ChangeConnectionMode(*mode),
-                ))
-                .push_maybe({
-                    #[cfg(feature = "usb")]
-                    {
-                        Some(radio(
-                            text(fl!("connection_usb")),
-                            &ConnectionMode::Usb,
-                            Some(connection_mode),
-                            |mode| AppMsg::ChangeConnectionMode(*mode),
-                        ))
-                    }
-
-                    #[cfg(not(feature = "usb"))]
-                    {
-                        Option::<Element<AppMsg>>::None
-                    }
-                })
-                .push_maybe({
-                    #[cfg(feature = "adb")]
-                    {
-                        Some(radio(
-                            text(fl!("connection_adb")),
-                            &ConnectionMode::Adb,
-                            Some(connection_mode),
-                            |mode| AppMsg::ChangeConnectionMode(*mode),
-                        ))
-                    }
-
-                    #[cfg(not(feature = "adb"))]
-                    {
-                        Option::<Element<AppMsg>>::None
-                    }
-                }),
-        )
+        .push(modes)
         .push(connect_button(app))
+        .push(text(app.status_text()))
+        .push_maybe(
+            (auto && app.connection_state == ConnectionState::Listening)
+                .then(|| text::caption(fl!("listening_auto_hint"))),
+        )
         .into()
 }
 

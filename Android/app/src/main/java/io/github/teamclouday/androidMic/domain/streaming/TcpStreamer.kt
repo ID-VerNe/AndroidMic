@@ -26,12 +26,18 @@ class TcpStreamer(
     private val scope: CoroutineScope,
     private val tag: String,
     private val ip: String,
-    private var port: Int
+    private var port: Int,
+    /** LAN address tried after loopback in `AUTO`; null means USB only. */
+    private val fallbackIp: String? = null,
+    /** `AUTO` keeps the stream alive across a cable pull / replug. */
+    private val autoReconnect: Boolean = false,
 ) : Streamer {
 
+    @Volatile
     private var socket: Socket? = null
     private var streamJob: Job? = null
     private var readerJob: Job? = null
+    private var reconnectJob: Job? = null
 
     // serializes every write on the socket (audio frames and the hello ack) so two frames
     // can't interleave and corrupt the length prefix
@@ -72,8 +78,26 @@ class TcpStreamer(
         ) = TcpStreamer(
             scope = scope,
             tag = "AdbStreamer",
-            ip = "127.0.0.1",
+            ip = AutoTransport.LOOPBACK,
             port = port
+        )
+
+        /**
+         * `AUTO`: loopback (the PC's `adb reverse` tunnel) first, then the
+         * configured LAN address, and keep retrying across a drop instead of
+         * ending the stream.
+         */
+        fun auto(
+            scope: CoroutineScope,
+            lanIp: String?,
+            port: Int
+        ) = TcpStreamer(
+            scope = scope,
+            tag = "AutoStreamer",
+            ip = AutoTransport.LOOPBACK,
+            port = port,
+            fallbackIp = lanIp,
+            autoReconnect = true
         )
     }
 
@@ -83,18 +107,27 @@ class TcpStreamer(
 
     // connect to server
     override fun connect(): Boolean {
+        // AUTO walks loopback then LAN; the manual transports keep their single
+        // configured endpoint.
+        val candidates =
+            if (autoReconnect) AutoTransport.candidates(fallbackIp) else listOf(ip)
 
-        val p = port
-        val socket = createSocket(p, 1500) ?: return false
+        for (candidate in candidates) {
+            val socket = createSocket(candidate, port, AutoTransport.CONNECT_TIMEOUT_MS)
+                ?: continue
 
-        if (!handShake(socket)) {
-            Log.d(tag, "connect [Socket]: handshake error")
-            socket.close()
-            return false
+            if (!handShake(socket)) {
+                Log.d(tag, "connect [$candidate]: handshake error")
+                closeQuietly(socket)
+                continue
+            }
+
+            this.socket = socket
+            Log.d(tag, "connect [$candidate]: connected")
+            return true
         }
 
-        this.socket = socket
-        return true
+        return false
     }
 
     // stream data through socket
@@ -126,6 +159,12 @@ class TcpStreamer(
                     }
                 } catch (e: IOException) {
                     Log.d(tag, "${e.message}")
+                    if (autoReconnect) {
+                        // Pulled cable / lost tunnel: keep the session alive and
+                        // switch path instead of tearing the stream down (AC2).
+                        scheduleReconnect(tx)
+                        return@collect
+                    }
                     delay(5)
                     disconnect()
                     tx.send(CommandData(Command.StopStream).toCommandMsg())
@@ -138,25 +177,25 @@ class TcpStreamer(
 
     // disconnect from server
     override fun disconnect(): Boolean {
-        if (socket == null) return false
-        try {
-            socket?.close()
-        } catch (e: IOException) {
-            Log.d(tag, "disconnect [close]: ${e.message}")
-            socket = null
-            readerJob?.cancel()
-            readerJob = null
-            streamJob?.cancel()
-            streamJob = null
-            return false
-        }
+        reconnectJob?.cancel()
+        reconnectJob = null
+        val hadSocket = socket != null
+        teardownStream()
+        Log.d(tag, "disconnect: complete")
+        return hadSocket
+    }
+
+    /** Drop the live connection without touching the reconnect supervisor. */
+    private fun teardownStream() {
+        val current = socket
         socket = null
+        if (current != null) {
+            closeQuietly(current)
+        }
         readerJob?.cancel()
         readerJob = null
         streamJob?.cancel()
         streamJob = null
-        Log.d(tag, "disconnect: complete")
-        return true
     }
 
     // shutdown streamer
@@ -176,20 +215,87 @@ class TcpStreamer(
     }
 
 
-    fun createSocket(p: Int, timeout: Int): Socket? {
+    fun createSocket(host: String, p: Int, timeout: Int): Socket? {
         val socket = Socket()
         return try {
             // send small audio packets right away instead of batching them (Nagle)
             socket.tcpNoDelay = true
-            socket.connect(InetSocketAddress(ip, p), timeout)
+            socket.connect(InetSocketAddress(host, p), timeout)
             socket.soTimeout = timeout
             socket
         } catch (e: IOException) {
-            Log.d(tag, "connect [Socket]: ${e.message}")
+            Log.d(tag, "connect [$host]: ${e.message}")
             null
         } catch (e: SocketTimeoutException) {
-            Log.d(tag, "connect [Socket]: ${e.message}")
+            Log.d(tag, "connect [$host]: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Bounded reconnect for `AUTO`: alternate the candidates for
+     * [AutoTransport.RECONNECT_WINDOW_MS], restart the control reader on
+     * success, and only then report the disconnect upstream.
+     */
+    private fun scheduleReconnect(tx: Messenger) {
+        if (reconnectJob?.isActive == true) return
+
+        reconnectJob = scope.launch {
+            closeCurrentSocket()
+
+            val deadline = System.currentTimeMillis() + AutoTransport.RECONNECT_WINDOW_MS
+            while (isActive && System.currentTimeMillis() < deadline) {
+                delay(AutoTransport.RECONNECT_DELAY_MS)
+
+                for (candidate in AutoTransport.candidates(fallbackIp)) {
+                    // `createSocket` and `handShake` block; a user disconnect or a
+                    // newer reconnect must not end up with a socket nobody owns.
+                    if (!isActive) return@launch
+
+                    val newSocket =
+                        createSocket(candidate, port, AutoTransport.CONNECT_TIMEOUT_MS)
+                            ?: continue
+
+                    if (!isActive) {
+                        closeQuietly(newSocket)
+                        return@launch
+                    }
+
+                    val handshakeOk = handShake(newSocket)
+                    // The handshake blocks up to CONNECT_TIMEOUT_MS; a disconnect
+                    // during it must not leave this socket installed.
+                    if (!handshakeOk || !isActive) {
+                        closeQuietly(newSocket)
+                        if (!isActive) return@launch
+                        continue
+                    }
+
+                    socket = newSocket
+                    startReader()
+                    Log.d(tag, "reconnected [$candidate]")
+                    return@launch
+                }
+            }
+
+            if (!isActive) return@launch
+
+            Log.d(tag, "auto reconnect gave up after ${AutoTransport.RECONNECT_WINDOW_MS} ms")
+            teardownStream()
+            runCatching { tx.send(CommandData(Command.StopStream).toCommandMsg()) }
+        }
+    }
+
+    private fun closeCurrentSocket() {
+        val current = socket ?: return
+        socket = null
+        closeQuietly(current)
+    }
+
+    private fun closeQuietly(target: Socket) {
+        try {
+            target.close()
+        } catch (e: IOException) {
+            Log.d(tag, "close: ${e.message}")
         }
     }
 
@@ -257,10 +363,11 @@ class TcpStreamer(
                 }
             }
 
-            // An explicit disconnect nulls the socket; if it is still set the reader broke
-            // unexpectedly, so fail the control channel open instead of freezing the gate
-            // at its last state.
-            if (failure != null && this@TcpStreamer.socket != null) {
+            // An explicit disconnect nulls the socket; if it is still the one this
+            // reader was bound to, the reader broke unexpectedly, so fail the control
+            // channel open instead of freezing the gate at its last state. A
+            // reconnect replaces the socket, and the old reader must not fire this.
+            if (failure != null && this@TcpStreamer.socket === socket) {
                 Log.w(tag, "reader: control channel closed unexpectedly (${failure}); failing open")
                 captureListener?.onCaptureChannelClosed()
             }

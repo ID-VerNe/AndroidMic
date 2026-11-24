@@ -53,7 +53,7 @@ title_app = App
 
 start_at_login = Start at login
 start_minimized = Start minimized
-auto_connect = Auto connect
+auto_connect = Connect on startup
 theme = Theme
 amplify = Amplify
 
@@ -84,3 +84,14 @@ on_demand_state_standby = On standby
 on_demand_state_capturing = Capturing on demand
 on_demand_state_degraded = Always-on (degraded)
 on_demand_state_legacy = Legacy phone: always-on
+
+connection_auto = Automatic
+connection_auto_hint = USB when the cable is in, Wi-Fi otherwise. Listens on all network interfaces.
+connection_manual = Specify manually
+fallback_address = Fallback address
+fallback_address_hint = Used when the cable is unplugged
+path_usb = USB
+path_wifi = Wi-Fi { $ip }
+state_connected_path = Connected · { $path }
+listening_auto_hint = Listening — waiting for the phone over USB or Wi-Fi. The phone must also be set to Automatic.
+usb_link_lost = USB link lost, reconnecting over Wi-Fi…

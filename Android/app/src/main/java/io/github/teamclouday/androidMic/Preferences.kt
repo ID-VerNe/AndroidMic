@@ -89,7 +89,14 @@ enum class AudioSource {
 }
 
 enum class Mode {
-    WIFI, UDP, USB, ADB
+    WIFI, UDP, USB, ADB,
+
+    /**
+     * Pick the transport from the live plug state: the loopback `adb reverse`
+     * tunnel when a cable is in, the configured LAN address otherwise. Appended
+     * (not inserted) so stored preference names keep resolving.
+     */
+    AUTO
 }
 
 enum class Themes {

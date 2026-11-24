@@ -53,7 +53,7 @@ title_app = 应用程序
 
 start_at_login = 开机启动
 start_minimized = 最小化启动
-auto_connect = 自动连接
+auto_connect = 启动时连接
 theme = 主题
 amplify = 放大
 
@@ -84,3 +84,14 @@ on_demand_state_standby = 按需待命
 on_demand_state_capturing = 采集中
 on_demand_state_degraded = 降级常开
 on_demand_state_legacy = 旧版不支持：常开
+
+connection_auto = 自动
+connection_auto_hint = 插线走 USB，拔线走 Wi-Fi。监听所有网络接口。
+connection_manual = 手动指定
+fallback_address = 备用地址
+fallback_address_hint = 拔线后使用
+path_usb = USB
+path_wifi = Wi-Fi { $ip }
+state_connected_path = 已连接 · { $path }
+listening_auto_hint = 正在监听 — 等待手机通过 USB 或 Wi-Fi 连接。手机端也需要选择「自动」。
+usb_link_lost = USB 链路断开，正在通过 Wi-Fi 重连…

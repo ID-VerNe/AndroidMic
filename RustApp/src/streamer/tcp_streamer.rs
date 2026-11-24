@@ -25,7 +25,7 @@ use crate::{
     },
 };
 
-use super::{AudioPacketMessage, AudioStream, ConnectError, StreamerTrait};
+use super::{AudioPacketMessage, AudioStream, ConnectError, StreamerTrait, TransportPath};
 
 const MAX_WAIT_TIME: Duration = Duration::from_millis(1500);
 
@@ -52,6 +52,9 @@ pub struct TcpStreamer {
     ip: IpAddr,
     pub port: u16,
     pub state: TcpStreamerState,
+    /// Peer of the current (or last) accepted connection. `None` while
+    /// listening, so a status read cannot report a stale remote address.
+    peer: Option<SocketAddr>,
     stream_config: AudioStream,
     process_cache: ProcessCache,
     keepalive: TcpKeepaliveConfig,
@@ -185,12 +188,38 @@ pub async fn new(
         port: addr.port(),
         stream_config,
         state: TcpStreamerState::Listening { listener },
+        peer: None,
         process_cache: ProcessCache::new(),
         keepalive,
         capture: CaptureChannel::new(on_demand_enabled),
     };
 
     Ok(streamer)
+}
+
+impl TcpStreamer {
+    /// Peer address of the live connection, when one is accepted.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
+    /// Message describing the live connection, with the transport derived from
+    /// the actual peer: a loopback accept can only have arrived through the
+    /// `adb reverse` tunnel.
+    fn connected_msg(&self, mode: ConnectionMode) -> StreamerMsg {
+        StreamerMsg::Connected {
+            ip: Some(self.ip),
+            port: Some(self.port),
+            mode,
+            path: self.peer.map(|peer| {
+                if peer.ip().is_loopback() {
+                    TransportPath::Wired
+                } else {
+                    TransportPath::Lan(peer.ip())
+                }
+            }),
+        }
+    }
 }
 
 /// Bind a listening socket with `SO_REUSEADDR` set, so a quick rebind after a
@@ -240,11 +269,7 @@ impl StreamerTrait for TcpStreamer {
                 ip: Some(self.ip),
                 port: Some(self.port),
             },
-            TcpStreamerState::Streaming { .. } => StreamerMsg::Connected {
-                ip: Some(self.ip),
-                port: Some(self.port),
-                mode: ConnectionMode::Tcp,
-            },
+            TcpStreamerState::Streaming { .. } => self.connected_msg(ConnectionMode::Tcp),
         }
     }
 
@@ -293,6 +318,7 @@ impl StreamerTrait for TcpStreamer {
                 }
 
                 info!("connection accepted, remote address: {}", addr);
+                self.peer = Some(addr);
 
                 let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
 
@@ -333,11 +359,7 @@ impl StreamerTrait for TcpStreamer {
                     disconnect_loop_detecter: 0,
                 };
 
-                Outcome::Msg(Some(StreamerMsg::Connected {
-                    ip: Some(self.ip),
-                    port: Some(self.port),
-                    mode: ConnectionMode::Tcp,
-                }))
+                Outcome::Msg(Some(self.connected_msg(ConnectionMode::Tcp)))
             }
             TcpStreamerState::Streaming {
                 framed,
@@ -516,6 +538,7 @@ impl TcpStreamer {
             match bind_reusable(self.ip, self.port).await {
                 Ok(listener) => {
                     self.process_cache.clear();
+                    self.peer = None;
                     self.state = TcpStreamerState::Listening { listener };
 
                     info!(

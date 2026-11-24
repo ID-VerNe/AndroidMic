@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::net::IpAddr;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -9,7 +10,7 @@ use crate::{
 };
 
 use super::{
-    AudioStream, ConnectError, StreamerTrait,
+    AudioStream, ConnectError, StreamerTrait, TransportPath,
     tcp_streamer::{TcpStreamer, TcpStreamerState},
 };
 
@@ -28,34 +29,136 @@ const ADB_REVERSE_ATTEMPTS: u32 = 3;
 const ADB_REVERSE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Android app package names. The debug build uses an `applicationIdSuffix`.
-const ANDROID_APP_PACKAGES: [&str; 2] = [
+pub(crate) const ANDROID_APP_PACKAGES: [&str; 2] = [
     "io.github.teamclouday.AndroidMic",
     "io.github.teamclouday.AndroidMic.debug",
 ];
 /// Extra read by MainActivity to start the stream without a phone-side tap.
 const AUTO_CONNECT_EXTRA: &str = "io.github.teamclouday.androidMic.extra.AUTO_CONNECT";
+/// Extra carrying the PC's LAN address, so the phone can fall back to Wi-Fi
+/// after an unplug without the user typing an IP.
+const PC_IP_EXTRA: &str = "io.github.teamclouday.androidMic.extra.PC_IP";
+/// Extra carrying the PC's listening port.
+const PC_PORT_EXTRA: &str = "io.github.teamclouday.androidMic.extra.PC_PORT";
 
-async fn get_connected_devices() -> Result<Vec<String>, ConnectError> {
+/// What an `adb devices` line actually is. Only `Wired` may drive the loopback
+/// tunnel of the automatic transport: a wireless-debugging serial is already a
+/// network peer and an emulator is not a phone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceKind {
+    /// USB cable, debugging authorized.
+    Wired,
+    /// `adb connect host:port`.
+    Wireless,
+    /// `emulator-<n>`.
+    Emulator,
+    /// USB cable, debugging not authorized yet.
+    Unauthorized,
+    /// Any other state (`offline`, `no permissions`, ...).
+    Unusable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdbDevice {
+    pub serial: String,
+    pub kind: DeviceKind,
+}
+
+/// A serial is wired when it carries no `host:port` suffix and is not an
+/// emulator. `adb devices -l` no longer prints a `usb:` field on current
+/// platform-tools (verified on 37.0.0 with a MI 9 attached), so the serial alone
+/// has to be enough.
+pub(crate) fn is_wired_serial(serial: &str) -> bool {
+    !serial.contains(':') && !serial.starts_with("emulator-")
+}
+
+/// Parse `adb devices` output. Pure so the classification can be unit-tested
+/// against captured platform-tools output.
+pub(crate) fn classify_devices(output: &str) -> Vec<AdbDevice> {
+    output
+        .lines()
+        .skip(1) // "List of devices attached"
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let serial = parts.next()?;
+            let state = parts.next()?;
+
+            let kind = match state {
+                "device" if serial.starts_with("emulator-") => DeviceKind::Emulator,
+                "device" if serial.contains(':') => DeviceKind::Wireless,
+                "device" => DeviceKind::Wired,
+                "unauthorized" => DeviceKind::Unauthorized,
+                _ => DeviceKind::Unusable,
+            };
+
+            Some(AdbDevice {
+                serial: serial.to_string(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// Whether `adb reverse --list` already maps `tcp:<port>` to `tcp:<port>`.
+/// The listing looks like `UsbFfs tcp:54345 tcp:54345` (or `host-3 tcp:...`).
+pub(crate) fn reverse_list_has_port(listing: &str, port: u16) -> bool {
+    let mapping = format!("tcp:{port} tcp:{port}");
+    listing.lines().any(|line| line.contains(&mapping))
+}
+
+pub(crate) async fn probe_devices() -> Result<Vec<AdbDevice>, ConnectError> {
     let mut cmd = Command::new("adb");
     cmd.arg("devices");
 
     let output = exec_cmd(cmd).await?;
-    let mut devices = Vec::new();
-
-    // Skip the first line which is "List of devices attached"
-    for line in output.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        // only an authorized, ready device can accept `adb reverse`; skip
-        // `unauthorized` / `offline` entries
-        if parts.len() >= 2 && parts[1] == "device" {
-            devices.push(parts[0].to_string());
-        }
-    }
-
-    Ok(devices)
+    Ok(classify_devices(&output))
 }
 
-async fn remove_adb_reverse_proxy(device_id: &str, port: u16) -> Result<(), ConnectError> {
+/// Every serial able to accept `adb reverse`. `ConnectionMode::Adb` deliberately
+/// keeps emulators: a tunnel to an emulator is legitimate, and this PR must not
+/// narrow a transport it does not own.
+async fn get_connected_devices() -> Result<Vec<String>, ConnectError> {
+    Ok(probe_devices()
+        .await?
+        .into_iter()
+        .filter(|device| {
+            matches!(
+                device.kind,
+                DeviceKind::Wired | DeviceKind::Wireless | DeviceKind::Emulator
+            )
+        })
+        .map(|device| device.serial)
+        .collect())
+}
+
+/// USB-attached, authorized devices only: the set the automatic transport may
+/// route over the loopback tunnel.
+pub(crate) async fn get_wired_devices() -> Result<Vec<String>, ConnectError> {
+    Ok(probe_devices()
+        .await?
+        .into_iter()
+        .filter(|device| device.kind == DeviceKind::Wired)
+        .map(|device| device.serial)
+        .collect())
+}
+
+/// Whether the reverse tunnel of `serial` is still alive. `adb kill-server`, an
+/// adb server restart or a replug can drop it while the device stays attached.
+pub(crate) async fn reverse_mapping_present(
+    serial: &str,
+    port: u16,
+) -> Result<bool, ConnectError> {
+    let mut cmd = Command::new("adb");
+    cmd.arg("-s").arg(serial).arg("reverse").arg("--list");
+
+    let listing = exec_cmd(cmd).await?;
+    Ok(reverse_list_has_port(&listing, port))
+}
+
+pub(crate) async fn remove_adb_reverse_proxy(
+    device_id: &str,
+    port: u16,
+) -> Result<(), ConnectError> {
     let mut cmd = Command::new("adb");
     cmd.arg("-s")
         .arg(device_id)
@@ -68,7 +171,7 @@ async fn remove_adb_reverse_proxy(device_id: &str, port: u16) -> Result<(), Conn
     Ok(())
 }
 
-async fn exec_cmd(mut cmd: Command) -> Result<String, ConnectError> {
+pub(crate) async fn exec_cmd(mut cmd: Command) -> Result<String, ConnectError> {
     // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000);
@@ -87,28 +190,34 @@ async fn exec_cmd(mut cmd: Command) -> Result<String, ConnectError> {
     Ok(stdout)
 }
 
-/// Recreate the reverse proxy for every currently attached device.
+/// Install (or refresh) the reverse tunnel of one device.
+pub(crate) async fn ensure_reverse_proxy(device_id: &str, port: u16) -> Result<(), ConnectError> {
+    if let Err(e) = remove_adb_reverse_proxy(device_id, port).await
+        && !e.to_string().contains("not found")
+    {
+        warn!("cannot remove adb proxy for device {device_id}: {e}");
+    }
+
+    let mut cmd = Command::new("adb");
+    cmd.arg("-s")
+        .arg(device_id)
+        .arg("reverse")
+        .arg(format!("tcp:{}", port))
+        .arg(format!("tcp:{}", port));
+    exec_cmd(cmd).await?;
+
+    Ok(())
+}
+
+/// Recreate the reverse proxy for every given device.
 /// `new()` and the post-drop recovery path share this sequence.
-async fn recreate_reverse_proxies(port: u16) -> Result<(), ConnectError> {
-    let devices = get_connected_devices().await?;
+async fn recreate_reverse_proxies(devices: &[String], port: u16) -> Result<(), ConnectError> {
     if devices.is_empty() {
         return Err(ConnectError::NoAdbDevice);
     }
 
-    for device_id in &devices {
-        if let Err(e) = remove_adb_reverse_proxy(device_id, port).await
-            && !e.to_string().contains("not found")
-        {
-            warn!("cannot remove adb proxy for device {device_id}: {e}");
-        }
-
-        let mut cmd = Command::new("adb");
-        cmd.arg("-s")
-            .arg(device_id)
-            .arg("reverse")
-            .arg(format!("tcp:{}", port))
-            .arg(format!("tcp:{}", port));
-        exec_cmd(cmd).await?;
+    for device_id in devices {
+        ensure_reverse_proxy(device_id, port).await?;
     }
 
     Ok(())
@@ -120,7 +229,12 @@ async fn rebuild_reverse_proxies(port: u16) -> Result<(), ConnectError> {
     let mut last_error = None;
 
     for attempt in 0..ADB_REVERSE_ATTEMPTS {
-        match recreate_reverse_proxies(port).await {
+        let result = match get_connected_devices().await {
+            Ok(devices) => recreate_reverse_proxies(&devices, port).await,
+            Err(e) => Err(e),
+        };
+
+        match result {
             Ok(()) => {
                 info!("adb reverse proxy rebuilt");
                 return Ok(());
@@ -144,9 +258,15 @@ async fn rebuild_reverse_proxies(port: u16) -> Result<(), ConnectError> {
 
 /// Ask the phone app to come to the foreground and auto-connect. This is
 /// what removes the phone-side Connect tap when the app is not already open.
-/// Release package first, debug build as a fallback; a missing package or a
-/// MIUI background-launch block only produces a warning.
-async fn launch_android_app(device_id: &str) -> Result<(), ConnectError> {
+/// The PC's LAN address and port ride along so an `Auto` phone can fall back to
+/// Wi-Fi without the user typing them. Release package first, debug build as a
+/// fallback; a missing package or a MIUI background-launch block only produces
+/// a warning.
+pub(crate) async fn launch_android_app(
+    device_id: &str,
+    fallback_ip: Option<IpAddr>,
+    port: u16,
+) -> Result<(), ConnectError> {
     let mut last_error = None;
 
     for package in ANDROID_APP_PACKAGES {
@@ -163,7 +283,14 @@ async fn launch_android_app(device_id: &str) -> Result<(), ConnectError> {
             ))
             .arg("--ez")
             .arg(AUTO_CONNECT_EXTRA)
-            .arg("true");
+            .arg("true")
+            .arg("--ei")
+            .arg(PC_PORT_EXTRA)
+            .arg(port.to_string());
+
+        if let Some(ip) = fallback_ip {
+            cmd.arg("--es").arg(PC_IP_EXTRA).arg(ip.to_string());
+        }
 
         match exec_cmd(cmd).await {
             Ok(_) => {
@@ -201,11 +328,11 @@ fn spawn_device_watch(port: u16, initially_present: bool) -> JoinHandle<()> {
 
             if now_present && !present {
                 info!("adb device attached: {devices:?}");
-                match rebuild_reverse_proxies(port).await {
+                match recreate_reverse_proxies(&devices, port).await {
                     Ok(()) => {
                         present = true;
                         for device_id in &devices {
-                            if let Err(e) = launch_android_app(device_id).await {
+                            if let Err(e) = launch_android_app(device_id, None, port).await {
                                 warn!("can't auto-start AndroidMic on {device_id}: {e}");
                             }
                         }
@@ -240,9 +367,9 @@ pub async fn new(
     let present = !devices.is_empty();
 
     if present {
-        recreate_reverse_proxies(port).await?;
+        recreate_reverse_proxies(&devices, port).await?;
         for device_id in &devices {
-            if let Err(e) = launch_android_app(device_id).await {
+            if let Err(e) = launch_android_app(device_id, None, port).await {
                 warn!("can't auto-start AndroidMic on {device_id}: {e}");
             }
         }
@@ -275,7 +402,17 @@ impl StreamerTrait for AdbStreamer {
             }
         }
 
-        Ok(msg)
+        // ADB mode always rides the tunnel, so the live path is wired even
+        // though the socket peer is loopback.
+        Ok(msg.map(|msg| match msg {
+            StreamerMsg::Connected { ip, port, mode, .. } => StreamerMsg::Connected {
+                ip,
+                port,
+                mode,
+                path: Some(TransportPath::Wired),
+            },
+            other => other,
+        }))
     }
 
     fn reconfigure_stream(&mut self, config: AudioStream) {
@@ -304,6 +441,7 @@ impl StreamerTrait for AdbStreamer {
                 ip: None,
                 port: None,
                 mode: ConnectionMode::Adb,
+                path: Some(TransportPath::Wired),
             },
         }
     }
@@ -322,5 +460,96 @@ impl Drop for AdbStreamer {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Captured from platform-tools 37.0.0 on Windows with a MI 9 attached.
+    const USB: &str = "List of devices attached\n\
+9e779dea               device product:cepheus model:MI_9 device:cepheus transport_id:1\n";
+    // `adb connect 192.168.1.5:5555`
+    const WIRELESS: &str = "List of devices attached\n\
+192.168.1.5:5555       device product:cepheus model:MI_9 device:cepheus transport_id:2\n";
+    const EMULATOR: &str = "List of devices attached\n\
+emulator-5554          device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 transport_id:3\n";
+    // Cable in, the RSA prompt not accepted yet.
+    const UNAUTHORIZED: &str = "List of devices attached\n\
+9e779dea               unauthorized usb:1-1 transport_id:2\n";
+    const EMPTY: &str = "List of devices attached\n";
+
+    fn kinds(output: &str) -> Vec<(String, DeviceKind)> {
+        classify_devices(output)
+            .into_iter()
+            .map(|device| (device.serial, device.kind))
+            .collect()
+    }
+
+    #[test]
+    fn wired_usb_device_is_classified_as_wired() {
+        assert_eq!(kinds(USB), vec![("9e779dea".into(), DeviceKind::Wired)]);
+    }
+
+    #[test]
+    fn wireless_debugging_is_not_wired() {
+        // A `host:port` serial is already a network peer: routing it over the
+        // loopback tunnel would duplicate the path the phone already has.
+        assert_eq!(
+            kinds(WIRELESS),
+            vec![("192.168.1.5:5555".into(), DeviceKind::Wireless)]
+        );
+        assert!(!is_wired_serial("192.168.1.5:5555"));
+    }
+
+    #[test]
+    fn emulator_is_not_wired() {
+        assert_eq!(
+            kinds(EMULATOR),
+            vec![("emulator-5554".into(), DeviceKind::Emulator)]
+        );
+        assert!(!is_wired_serial("emulator-5554"));
+    }
+
+    #[test]
+    fn unauthorized_cable_is_not_wired() {
+        // AC4: a cable with an unaccepted debugging prompt must fall back to
+        // Wi-Fi instead of being counted as a usable loopback device.
+        assert_eq!(
+            kinds(UNAUTHORIZED),
+            vec![("9e779dea".into(), DeviceKind::Unauthorized)]
+        );
+    }
+
+    #[test]
+    fn empty_listing_has_no_devices() {
+        assert!(kinds(EMPTY).is_empty());
+        assert!(kinds("").is_empty());
+    }
+
+    #[test]
+    fn offline_device_is_unusable() {
+        let output = "List of devices attached\n9e779dea               offline transport_id:4\n";
+        assert_eq!(kinds(output), vec![("9e779dea".into(), DeviceKind::Unusable)]);
+    }
+
+    #[test]
+    fn reverse_listing_detects_the_mapping() {
+        // Captured from `adb -s 9e779dea reverse --list` on platform-tools 37.0.0.
+        assert!(reverse_list_has_port("UsbFfs tcp:54345 tcp:54345", 54345));
+        assert!(reverse_list_has_port("host-3 tcp:54345 tcp:54345", 54345));
+        assert!(reverse_list_has_port(
+            "UsbFfs tcp:1234 tcp:1234\nUsbFfs tcp:54345 tcp:54345",
+            54345
+        ));
+    }
+
+    #[test]
+    fn reverse_listing_rejects_other_ports_and_empty() {
+        assert!(!reverse_list_has_port("", 54345));
+        assert!(!reverse_list_has_port("UsbFfs tcp:54346 tcp:54346", 54345));
+        // A one-sided mapping is not a usable tunnel.
+        assert!(!reverse_list_has_port("UsbFfs tcp:54345 tcp:1", 54345));
     }
 }

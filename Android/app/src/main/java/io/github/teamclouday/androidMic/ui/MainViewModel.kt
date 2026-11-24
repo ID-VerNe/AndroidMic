@@ -29,6 +29,7 @@ import io.github.teamclouday.androidMic.domain.service.Command
 import io.github.teamclouday.androidMic.domain.service.CommandData
 import io.github.teamclouday.androidMic.domain.service.ResponseData
 import io.github.teamclouday.androidMic.domain.service.ResponseKind
+import io.github.teamclouday.androidMic.domain.streaming.AutoTransport
 import io.github.teamclouday.androidMic.ui.utils.UiHelper
 import io.github.teamclouday.androidMic.utils.Either
 import kotlinx.coroutines.CompletableDeferred
@@ -232,14 +233,55 @@ class MainViewModel : ViewModel() {
 
             Log.d(TAG, "auto connect gave up after ${AutoConnectPolicy.attemptCount} attempts")
             pendingAutoConnect = false
+            // Drop the explicit request too, otherwise a later manual Connect
+            // would be licensed to start without the toggle on.
+            explicitAutoConnectRequest = false
         }
     }
 
-    /** Called by MainActivity when it receives an explicit auto-connect intent. */
-    fun requestAutoConnect() {
-        explicitAutoConnectRequest = true
-        pendingAutoConnect = true
-        maybeAutoConnect()
+    /**
+     * Called by MainActivity when it receives an explicit auto-connect intent.
+     *
+     * The PC also pushes its LAN address and port over the same intent, so an
+     * `AUTO` phone knows where to reconnect after the cable is pulled without
+     * the user typing an IP. Invalid addresses are ignored rather than stored.
+     */
+    fun requestAutoConnect(pcIp: String? = null, pcPort: Int? = null) {
+        val lanIp = AutoTransport.usableLanIp(pcIp)
+        val port = pcPort?.takeIf { it > 0 }
+
+        if (lanIp == null && port == null) {
+            explicitAutoConnectRequest = true
+            pendingAutoConnect = true
+            maybeAutoConnect()
+            return
+        }
+
+        viewModelScope.launch {
+            // Only fill in what is missing: a LAN address the user configured by
+            // hand wins over the one the PC happens to believe it has.
+            if (lanIp != null && AutoTransport.usableLanIp(prefs.ip.get()) == null) {
+                prefs.ip.update(lanIp)
+            }
+            port?.let { prefs.port.update(it.toString()) }
+            explicitAutoConnectRequest = true
+            pendingAutoConnect = true
+
+            // The PC only pushes the endpoint when a cable was just attached, so
+            // a running AUTO stream is on Wi-Fi: restart it to move back to the
+            // wired path without the user touching anything (AC3). The reply
+            // handler re-arms `maybeAutoConnect` once the service reports the
+            // stream stopped.
+            if (isStreamStarted.value && prefs.mode.get() == Mode.AUTO) {
+                Log.d(TAG, "auto: cable attached while streaming, restarting for the USB path")
+                val stop = CommandData(Command.StopStream).toCommandMsg()
+                stop.replyTo = messenger
+                service?.send(stop)
+                return@launch
+            }
+
+            maybeAutoConnect()
+        }
     }
 
     private suspend fun attemptStartStream(): Boolean {
@@ -282,8 +324,11 @@ class MainViewModel : ViewModel() {
     private suspend fun shouldAutoConnect(): Boolean {
         if (!isBound || isStreamStarted.value || !isButtonConnectClickable.value) return false
         if (autoConnectPausedLocal) return false
-        if (!prefs.autoConnect.get()) return false
-        if (prefs.mode.get() != Mode.ADB) return false
+        val mode = prefs.mode.get()
+        if (mode != Mode.ADB && mode != Mode.AUTO) return false
+        // A request pushed by the PC is reason enough to start: the switch only
+        // governs launches the phone makes on its own.
+        if (!explicitAutoConnectRequest && !prefs.autoConnect.get()) return false
         if (prefs.autoConnectPaused.get()) return false
         if (!hasRecordAudioPermission()) {
             Log.d(TAG, "auto connect: RECORD_AUDIO not granted, skipping")
@@ -295,7 +340,8 @@ class MainViewModel : ViewModel() {
     private fun canAutoConnectByPreferences(): Boolean {
         if (autoConnectPausedLocal) return false
         if (!prefs.autoConnect.getBlocking()) return false
-        if (prefs.mode.getBlocking() != Mode.ADB) return false
+        val mode = prefs.mode.getBlocking()
+        if (mode != Mode.ADB && mode != Mode.AUTO) return false
         if (prefs.autoConnectPaused.getBlocking()) return false
         return hasRecordAudioPermission()
     }
@@ -325,7 +371,7 @@ class MainViewModel : ViewModel() {
     fun setMode(mode: Mode) {
         viewModelScope.launch {
             prefs.mode.update(mode)
-            if (mode == Mode.ADB && prefs.autoConnect.get()) {
+            if ((mode == Mode.ADB || mode == Mode.AUTO) && prefs.autoConnect.get()) {
                 explicitAutoConnectRequest = true
                 pendingAutoConnect = true
                 maybeAutoConnect()

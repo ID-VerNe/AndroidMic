@@ -10,7 +10,11 @@ use udp_streamer::UdpStreamer;
 #[cfg(feature = "adb")]
 mod adb_streamer;
 #[cfg(feature = "adb")]
+mod auto_streamer;
+#[cfg(feature = "adb")]
 use adb_streamer::AdbStreamer;
+#[cfg(feature = "adb")]
+use auto_streamer::AutoStreamer;
 
 mod message;
 mod streamer_runner;
@@ -26,7 +30,7 @@ use crate::streamer::usb_streamer::UsbStreamer;
 
 pub use message::AudioPacketMessage;
 pub use streamer_runner::{
-    CaptureLinkStatus, ConnectOption, StreamerCommand, StreamerMsg, sub,
+    CaptureLinkStatus, ConnectOption, StreamerCommand, StreamerMsg, TransportPath, sub,
 };
 
 use crate::{
@@ -100,6 +104,8 @@ enum Streamer {
     TcpStreamer,
     #[cfg(feature = "adb")]
     AdbStreamer,
+    #[cfg(feature = "adb")]
+    AutoStreamer,
     UdpStreamer,
     #[cfg(feature = "usb")]
     UsbStreamer,

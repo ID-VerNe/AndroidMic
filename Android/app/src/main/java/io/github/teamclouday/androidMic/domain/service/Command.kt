@@ -10,6 +10,7 @@ import io.github.teamclouday.androidMic.Dialogs
 import io.github.teamclouday.androidMic.Mode
 import io.github.teamclouday.androidMic.SampleRates
 import io.github.teamclouday.androidMic.domain.audio.CaptureGate
+import io.github.teamclouday.androidMic.domain.streaming.AutoTransport
 import io.github.teamclouday.androidMic.utils.Either
 import io.github.teamclouday.androidMic.utils.checkIp
 import io.github.teamclouday.androidMic.utils.checkPort
@@ -123,6 +124,21 @@ data class CommandData(
                     } catch (_: Exception) {
                         null
                     }
+                }
+
+                // AUTO needs the port and, when present, the LAN address the
+                // phone falls back to. A blank address only disables the Wi-Fi
+                // fallback (USB still works), so it is not a validation error.
+                Mode.AUTO -> {
+                    if (!checkPort(port)) {
+                        return Either.Right(Dialogs.Port)
+                    }
+                    data.port = try {
+                        port.toInt()
+                    } catch (_: Exception) {
+                        null
+                    }
+                    data.ip = AutoTransport.usableLanIp(ip)
                 }
 
                 else -> {}

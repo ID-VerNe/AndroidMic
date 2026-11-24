@@ -318,7 +318,9 @@ class ForegroundService : Service() {
         )
 
         states.isStreamStarted = true
-        if (msg.mode == Mode.WIFI || msg.mode == Mode.UDP) {
+        // AUTO rides Wi-Fi whenever the cable is out, so it keeps the same
+        // performance locks as the manual network transports.
+        if (msg.mode == Mode.WIFI || msg.mode == Mode.UDP || msg.mode == Mode.AUTO) {
             acquireWifiLocks()
         }
         Log.d(TAG, "startStream [connected]")

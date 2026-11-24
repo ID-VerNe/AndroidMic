@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-use super::{AudioPacketMessage, ConnectError, StreamerMsg, StreamerTrait};
+use super::{AudioPacketMessage, ConnectError, StreamerMsg, StreamerTrait, TransportPath};
 
 const TRANSFER_BUFFER_SIZE: usize = 1024;
 
@@ -201,6 +201,7 @@ impl StreamerTrait for UsbStreamer {
                 ip: None,
                 port: None,
                 mode: ConnectionMode::Usb,
+                path: Some(TransportPath::Wired),
             }
         }
     }
@@ -275,6 +276,7 @@ impl StreamerTrait for UsbStreamer {
                                             ip: None,
                                             port: None,
                                             mode: ConnectionMode::Usb,
+                                            path: Some(TransportPath::Wired),
                                         }))
                                     } else {
                                         Ok(message)
