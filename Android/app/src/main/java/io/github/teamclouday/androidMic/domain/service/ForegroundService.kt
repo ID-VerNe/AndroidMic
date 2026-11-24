@@ -282,6 +282,11 @@ class ForegroundService : Service() {
 
         val gate = CaptureGate()
         captureGate = gate
+        // Push every gate transition to the UI so it can stop claiming the mic
+        // is recording while on-demand standby keeps it closed (issue #41).
+        gate.onStateChanged = { state ->
+            reply(uiMessenger, ResponseData(captureState = state))
+        }
         managerStream?.setCaptureListener(object : CaptureListener {
             override fun onCaptureHello(hello: CaptureMessage.Hello) {
                 gate.link(hello.captureEnabled)

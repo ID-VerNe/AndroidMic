@@ -23,6 +23,7 @@ import io.github.teamclouday.androidMic.Mode
 import io.github.teamclouday.androidMic.R
 import io.github.teamclouday.androidMic.SampleRates
 import io.github.teamclouday.androidMic.Themes
+import io.github.teamclouday.androidMic.domain.audio.CaptureGate
 import io.github.teamclouday.androidMic.domain.service.AutoConnectPolicy
 import io.github.teamclouday.androidMic.domain.service.Command
 import io.github.teamclouday.androidMic.domain.service.CommandData
@@ -59,6 +60,9 @@ class MainViewModel : ViewModel() {
 
     val isMuted = mutableStateOf(false)
 
+    /** Live on-demand gate state; drives the status line above the log. */
+    val captureState = mutableStateOf(CaptureGate.State.Legacy)
+
     private var autoConnectJob: Job? = null
     private var autoAttempt: CompletableDeferred<Boolean>? = null
     private var autoConnectPausedLocal = false
@@ -79,6 +83,10 @@ class MainViewModel : ViewModel() {
                     data.isConnected?.let {
                         isButtonConnectClickable.value = true
                         isStreamStarted.value = it
+                        if (!it) {
+                            // disconnected: nothing is linked, so back to the legacy label
+                            captureState.value = CaptureGate.State.Legacy
+                        }
                         autoAttempt?.complete(it)
                         if (!it && pendingAutoConnect) {
                             maybeAutoConnect()
@@ -87,6 +95,10 @@ class MainViewModel : ViewModel() {
 
                     data.isMuted?.let {
                         isMuted.value = it
+                    }
+
+                    data.captureState?.let {
+                        captureState.value = it
                     }
 
                     data.msg?.let {

@@ -53,6 +53,10 @@
     <string name="stream_already_started">Stream already started</string>
     <string name="microphone_already_started">Microphone already started</string>
     <string name="microphone_not_recording">Microphone is not recording</string>
+    <string name="capture_state_legacy">PC (legacy): always-on capture</string>
+    <string name="capture_state_standby">On-demand standby: microphone closed</string>
+    <string name="capture_state_capturing">Capturing: microphone open</string>
+    <string name="capture_state_muted">Muted</string>
 
     <string name="connected_device">Connected Device:\n</string>
     <string name="mic_start_recording">Microphone has started to record</string>

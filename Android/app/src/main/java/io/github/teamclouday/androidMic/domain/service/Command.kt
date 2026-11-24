@@ -9,6 +9,7 @@ import io.github.teamclouday.androidMic.ChannelCount
 import io.github.teamclouday.androidMic.Dialogs
 import io.github.teamclouday.androidMic.Mode
 import io.github.teamclouday.androidMic.SampleRates
+import io.github.teamclouday.androidMic.domain.audio.CaptureGate
 import io.github.teamclouday.androidMic.utils.Either
 import io.github.teamclouday.androidMic.utils.checkIp
 import io.github.teamclouday.androidMic.utils.checkPort
@@ -19,6 +20,7 @@ import io.github.teamclouday.androidMic.utils.checkPort
 private const val ID_MSG: String = "ID_MSG"
 private const val ID_CONNECTION_STATE: String = "ID_CONNECTION_STATE"
 private const val ID_MUTE_STATE: String = "ID_MUTE_STATE"
+private const val ID_CAPTURE_STATE: String = "ID_CAPTURE_STATE"
 
 /**
  * UI -> Service
@@ -178,6 +180,8 @@ data class ResponseData(
     val msg: String? = null,
     val isConnected: Boolean? = null,
     val isMuted: Boolean? = null,
+    /** Live on-demand gate state, so the UI stops claiming the mic is recording. */
+    val captureState: CaptureGate.State? = null,
     val kind: ResponseKind = ResponseKind.Standard,
 ) {
 
@@ -190,6 +194,8 @@ data class ResponseData(
                     ?.let { ConnectionState.entries[it] == ConnectionState.Connected },
                 isMuted = msg.data.getOrdinal(ID_MUTE_STATE)
                     ?.let { MuteState.entries[it] == MuteState.Muted },
+                captureState = msg.data.getOrdinal(ID_CAPTURE_STATE)
+                    ?.let { CaptureGate.State.entries[it] },
                 msg = msg.data.getString(ID_MSG)
             )
         }
@@ -212,6 +218,9 @@ data class ResponseData(
                 ID_MUTE_STATE,
                 (if (it) MuteState.Muted else MuteState.Unmuted).ordinal
             )
+        }
+        this.captureState?.let {
+            r.putInt(ID_CAPTURE_STATE, it.ordinal)
         }
 
         val reply = Message.obtain()

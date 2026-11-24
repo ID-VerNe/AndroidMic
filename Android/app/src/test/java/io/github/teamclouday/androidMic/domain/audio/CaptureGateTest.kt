@@ -1,5 +1,6 @@
 package io.github.teamclouday.androidMic.domain.audio
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -185,5 +186,90 @@ class CaptureGateTest {
         assertFalse(gate.linked)
         assertTrue(gate.update(muted = true))
         assertTrue(gate.isCapturing)
+    }
+}
+
+class CaptureGateStateTest {
+
+    private var now = 0L
+    private val clock = { now }
+
+    @Test
+    fun `state starts as legacy and reports every transition once`() {
+        val gate = CaptureGate(clock)
+        val seen = mutableListOf<CaptureGate.State>()
+        gate.onStateChanged = { seen.add(it) }
+
+        // nothing linked yet: legacy always-on
+        gate.update(muted = false)
+        assertTrue(seen.isEmpty())
+
+        // hello with demand off -> the gate first runs the off debounce (existing
+        // CaptureGate semantics: the shutdown delay also covers the first demand-off),
+        // then settles into standby
+        gate.link(initialEnabled = false)
+        gate.update(muted = false)
+        assertEquals(listOf(CaptureGate.State.Capturing), seen)
+
+        now += CaptureGate.OFF_DEBOUNCE_MS
+        gate.update(muted = false)
+        assertEquals(
+            listOf(CaptureGate.State.Capturing, CaptureGate.State.Standby),
+            seen,
+        )
+
+        // repeated updates without a change must not notify again
+        gate.update(muted = false)
+        gate.update(muted = false)
+        assertEquals(2, seen.size)
+
+        // demand on -> capturing
+        gate.setPcEnabled(true)
+        gate.update(muted = false)
+        assertEquals(CaptureGate.State.Capturing, seen.last())
+
+        // demand off flips back after the debounce window
+        gate.setPcEnabled(false)
+        gate.update(muted = false)
+        assertEquals(CaptureGate.State.Capturing, seen.last())
+        now += CaptureGate.OFF_DEBOUNCE_MS
+        gate.update(muted = false)
+        assertEquals(CaptureGate.State.Standby, seen.last())
+    }
+
+    @Test
+    fun `mute wins over demand and is published as muted`() {
+        val gate = CaptureGate(clock)
+        val seen = mutableListOf<CaptureGate.State>()
+        gate.onStateChanged = { seen.add(it) }
+
+        gate.link(initialEnabled = true)
+        gate.update(muted = false)
+        assertEquals(CaptureGate.State.Capturing, gate.state)
+
+        gate.update(muted = true)
+        assertEquals(CaptureGate.State.Muted, gate.state)
+        assertFalse(gate.isCapturing)
+        assertEquals(CaptureGate.State.Muted, seen.last())
+
+        gate.update(muted = false)
+        assertEquals(CaptureGate.State.Capturing, seen.last())
+    }
+
+    @Test
+    fun `reset returns to legacy and republishes`() {
+        val gate = CaptureGate(clock)
+        gate.link(initialEnabled = false)
+        gate.update(muted = false)
+        now += CaptureGate.OFF_DEBOUNCE_MS
+        gate.update(muted = false)
+        assertEquals(CaptureGate.State.Standby, gate.state)
+
+        val seen = mutableListOf<CaptureGate.State>()
+        gate.onStateChanged = { seen.add(it) }
+        gate.reset()
+
+        assertEquals(CaptureGate.State.Legacy, gate.state)
+        assertEquals(listOf(CaptureGate.State.Legacy), seen)
     }
 }
