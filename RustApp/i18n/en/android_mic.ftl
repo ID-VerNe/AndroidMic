@@ -86,7 +86,7 @@ on_demand_state_degraded = Always-on (degraded)
 on_demand_state_legacy = Legacy phone: always-on
 
 connection_auto = Automatic
-connection_auto_hint = USB when the cable is in, Wi-Fi otherwise
+connection_auto_hint = USB when the cable is in, Wi-Fi otherwise. Listens on all network interfaces.
 connection_manual = Specify manually
 fallback_address = Fallback address
 fallback_address_hint = Used when the cable is unplugged

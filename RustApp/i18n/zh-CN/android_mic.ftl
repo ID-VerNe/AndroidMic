@@ -86,7 +86,7 @@ on_demand_state_degraded = 降级常开
 on_demand_state_legacy = 旧版不支持：常开
 
 connection_auto = 自动
-connection_auto_hint = 插线走 USB，拔线走 Wi-Fi
+connection_auto_hint = 插线走 USB，拔线走 Wi-Fi。监听所有网络接口。
 connection_manual = 手动指定
 fallback_address = 备用地址
 fallback_address_hint = 拔线后使用

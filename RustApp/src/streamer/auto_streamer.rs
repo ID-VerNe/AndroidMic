@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -20,6 +20,10 @@ use super::{
 /// How often the watcher re-reads `adb devices`. Kept at the same cadence as
 /// the ADB watcher so both transports react to a plug within one tick.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Floor between two `am start` calls. A tunnel that keeps vanishing (an adb
+/// server in a restart loop, a flapping cable) would otherwise relaunch the
+/// phone app on every tick, and each launch restarts a running `Auto` stream.
+const RELAUNCH_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Automatic transport: one wildcard listener that serves both paths.
 ///
@@ -37,6 +41,24 @@ pub struct AutoStreamer {
 
 /// Log `note` only when it differs from the previous one, so a cable that stays
 /// plugged in without authorization produces one line instead of one per tick.
+/// Launch the phone app, rate-limited across the whole watch loop.
+async fn launch_throttled(
+    serial: &str,
+    fallback_ip: Option<IpAddr>,
+    port: u16,
+    last_launch: &mut Option<Instant>,
+    note: &mut Option<String>,
+) {
+    if last_launch.is_some_and(|at| at.elapsed() < RELAUNCH_MIN_INTERVAL) {
+        return;
+    }
+    *last_launch = Some(Instant::now());
+
+    if let Err(e) = launch_android_app(serial, fallback_ip, port).await {
+        note_once(note, format!("can't auto-start AndroidMic on {serial}: {e}"));
+    }
+}
+
 fn note_once(last: &mut Option<String>, note: String) {
     if last.as_deref() != Some(note.as_str()) {
         warn!("{note}");
@@ -54,6 +76,7 @@ fn spawn_device_watch(port: u16, fallback_ip: Option<IpAddr>) -> JoinHandle<()> 
         // tracker per failure category: clearing one must not silence another
         let mut adb_note: Option<String> = None;
         let mut device_note: Option<String> = None;
+        let mut last_launch: Option<Instant> = None;
 
         loop {
             let devices = match probe_devices().await {
@@ -89,14 +112,14 @@ fn spawn_device_watch(port: u16, fallback_ip: Option<IpAddr>) -> JoinHandle<()> 
                         match ensure_reverse_proxy(serial, port).await {
                             Ok(()) => {
                                 device_note = None;
-                                if let Err(e) =
-                                    launch_android_app(serial, fallback_ip, port).await
-                                {
-                                    note_once(
-                                        &mut device_note,
-                                        format!("can't auto-start AndroidMic on {serial}: {e}"),
-                                    );
-                                }
+                                launch_throttled(
+                                    serial,
+                                    fallback_ip,
+                                    port,
+                                    &mut last_launch,
+                                    &mut device_note,
+                                )
+                                .await;
                             }
                             Err(e) => note_once(
                                 &mut device_note,
@@ -114,16 +137,14 @@ fn spawn_device_watch(port: u16, fallback_ip: Option<IpAddr>) -> JoinHandle<()> 
                                         // The tunnel coming back does not mean the
                                         // phone is still streaming: an adb server
                                         // restart took the app down with it.
-                                        if let Err(e) =
-                                            launch_android_app(serial, fallback_ip, port).await
-                                        {
-                                            note_once(
-                                                &mut device_note,
-                                                format!(
-                                                    "can't auto-start AndroidMic on {serial}: {e}"
-                                                ),
-                                            );
-                                        }
+                                        launch_throttled(
+                                            serial,
+                                            fallback_ip,
+                                            port,
+                                            &mut last_launch,
+                                            &mut device_note,
+                                        )
+                                        .await;
                                     }
                                     Err(e) => note_once(
                                         &mut device_note,

@@ -76,7 +76,7 @@ on_demand_state_degraded = Toujours actif (dégradé)
 on_demand_state_legacy = Téléphone legacy : toujours actif
 
 connection_auto = Automatique
-connection_auto_hint = USB quand le câble est branché, Wi-Fi sinon
+connection_auto_hint = USB quand le câble est branché, Wi-Fi sinon. Écoute sur toutes les interfaces réseau.
 connection_manual = Choisir manuellement
 fallback_address = Adresse de repli
 fallback_address_hint = Utilisée quand le câble est débranché

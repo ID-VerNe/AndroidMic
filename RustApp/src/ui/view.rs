@@ -225,6 +225,7 @@ fn network_adapter(app: &AppState) -> Element<'_, AppMsg> {
 fn connection_type(app: &AppState) -> Element<'_, AppMsg> {
     let connection_mode = app.config.data().connection_mode;
     let auto = is_auto(connection_mode);
+    #[cfg(feature = "adb")]
     let manual_mode = app.manual_mode;
 
     // Grouped by policy, not by transport: the top-level choice is an outcome

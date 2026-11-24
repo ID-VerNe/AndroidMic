@@ -256,8 +256,17 @@ class TcpStreamer(
                         createSocket(candidate, port, AutoTransport.CONNECT_TIMEOUT_MS)
                             ?: continue
 
-                    if (!isActive || !handShake(newSocket)) {
+                    if (!isActive) {
                         closeQuietly(newSocket)
+                        return@launch
+                    }
+
+                    val handshakeOk = handShake(newSocket)
+                    // The handshake blocks up to CONNECT_TIMEOUT_MS; a disconnect
+                    // during it must not leave this socket installed.
+                    if (!handshakeOk || !isActive) {
+                        closeQuietly(newSocket)
+                        if (!isActive) return@launch
                         continue
                     }
 
