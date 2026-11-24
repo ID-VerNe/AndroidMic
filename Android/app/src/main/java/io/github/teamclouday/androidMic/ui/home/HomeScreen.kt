@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import io.github.teamclouday.androidMic.Dialogs
 import io.github.teamclouday.androidMic.Mode
 import io.github.teamclouday.androidMic.R
+import io.github.teamclouday.androidMic.domain.audio.CaptureGate
 import io.github.teamclouday.androidMic.ui.MainViewModel
 import io.github.teamclouday.androidMic.ui.components.ManagerButton
 import io.github.teamclouday.androidMic.ui.home.dialog.DialogIpPort
@@ -188,16 +189,42 @@ private fun Log(
             }
     )
     {
-        Text(
-            text = vm.textLog.value,
-            color = MaterialTheme.colorScheme.onSecondary,
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier
-                .verticalScroll(ScrollState(Int.MAX_VALUE))
-                .padding(15.dp)
-        )
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Pinned capture status: the log below is history, this line is the
+            // current truth. Before #41 the only hint was "microphone has started
+            // to record", which stayed there even while the gate held the mic shut.
+            if (vm.isStreamStarted.value) {
+                Text(
+                    text = captureStateLabel(vm.captureState.value),
+                    color = MaterialTheme.colorScheme.onSecondary,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.padding(start = 15.dp, top = 15.dp, end = 15.dp)
+                )
+            }
+
+            Text(
+                text = vm.textLog.value,
+                color = MaterialTheme.colorScheme.onSecondary,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(ScrollState(Int.MAX_VALUE))
+                    .padding(15.dp)
+            )
+        }
     }
 }
+
+@Composable
+private fun captureStateLabel(state: CaptureGate.State): String = stringResource(
+    id = when (state) {
+        CaptureGate.State.Legacy -> R.string.capture_state_legacy
+        CaptureGate.State.Standby -> R.string.capture_state_standby
+        CaptureGate.State.Capturing -> R.string.capture_state_capturing
+        CaptureGate.State.Muted -> R.string.capture_state_muted
+    }
+)
 
 @Composable
 private fun AudioSwitch(

@@ -28,6 +28,26 @@ class CaptureGate(
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) {
 
+    /**
+     * Coarse state of the capture gate, derived from [linked], [pcEnabled],
+     * [isCapturing] and the mute flag. This is what the UI shows: before #41 the
+     * app screen kept saying "microphone has started to record" even while the
+     * gate held the mic closed.
+     */
+    enum class State {
+        /** Legacy PC (no handshake): always-on capture, same as before the feature. */
+        Legacy,
+
+        /** Linked, no local demand: the microphone is closed on purpose. */
+        Standby,
+
+        /** Linked and the microphone is open. */
+        Capturing,
+
+        /** Linked but the user muted the phone: mic stays closed regardless of demand. */
+        Muted,
+    }
+
     companion object {
         const val OFF_DEBOUNCE_MS = 300L
         const val EXTENDED_OFF_DEBOUNCE_MS = 2000L
@@ -53,12 +73,34 @@ class CaptureGate(
     var isCapturing: Boolean = true
         private set
 
+    /** Latest derived [State]; published on every mutation, only when it changes. */
+    @Volatile
+    var state: State = State.Legacy
+        private set
+
+    private var muted = false
+
+    /**
+     * Invoked whenever [state] changes. Runs under the gate lock, so the callback
+     * must not call back into the gate.
+     *
+     * Assigned from the service thread and read from the capture loop, hence
+     * `@Volatile` even though the reference is set before the loop starts.
+     */
+    @Volatile
+    var onStateChanged: ((State) -> Unit)? = null
+
     private var previousPcEnabled = false
     private val risingEdges = mutableListOf<Long>()
     private var offDeadlineMs: Long? = null
     private var demandFalseSinceMs: Long? = null
 
-    /** Hello processed: on-demand mode is active. The hello's initial demand is not a rising edge. */
+    /**
+     * Hello processed: on-demand mode is active. The hello's initial demand is not a rising edge.
+     *
+     * The published [state] is not recomputed here: the capture loop calls [update]
+     * right after the handshake, and only that call knows the current mute flag.
+     */
     fun link(initialEnabled: Boolean) = synchronized(this) {
         linked = true
         pcEnabled = initialEnabled
@@ -90,12 +132,14 @@ class CaptureGate(
      * @return [isCapturing]
      */
     fun update(muted: Boolean): Boolean = synchronized(this) {
+        this.muted = muted
         val now = clock()
 
         if (!linked) {
             // legacy PC: always open, mute keeps the recorder alive (silence fill in the manager)
             isCapturing = true
             offDeadlineMs = null
+            publish()
             return true
         }
 
@@ -109,39 +153,54 @@ class CaptureGate(
 
         val target = pcEnabled && !muted
 
-        if (target) {
-            offDeadlineMs = null
-            isCapturing = true
-            return true
-        }
-
-        // mute wins: stop the mic immediately, no demand off-debounce applies
-        if (muted) {
-            offDeadlineMs = null
-            isCapturing = false
-            return false
-        }
-
-        // demand == false: start / continue the off debounce
-        if (offDeadlineMs == null && isCapturing) {
-            val delay = if (risingEdges.size >= EXTENDED_EDGE_COUNT) {
-                EXTENDED_OFF_DEBOUNCE_MS
-            } else {
-                OFF_DEBOUNCE_MS
-            }
-            offDeadlineMs = now + delay
-        }
-
-        val deadline = offDeadlineMs
         isCapturing = when {
-            deadline == null -> false
-            now < deadline -> true
-            else -> {
+            target -> {
+                offDeadlineMs = null
+                true
+            }
+            // mute wins: stop the mic immediately, no demand off-debounce applies
+            muted -> {
                 offDeadlineMs = null
                 false
             }
+            else -> {
+                // demand == false: start / continue the off debounce
+                if (offDeadlineMs == null && isCapturing) {
+                    val delay = if (risingEdges.size >= EXTENDED_EDGE_COUNT) {
+                        EXTENDED_OFF_DEBOUNCE_MS
+                    } else {
+                        OFF_DEBOUNCE_MS
+                    }
+                    offDeadlineMs = now + delay
+                }
+
+                val deadline = offDeadlineMs
+                if (deadline == null) {
+                    false
+                } else if (now < deadline) {
+                    true
+                } else {
+                    offDeadlineMs = null
+                    false
+                }
+            }
         }
-        return isCapturing
+
+        publish()
+        isCapturing
+    }
+
+    /** Derive [state] from the published fields and notify on change. */
+    private fun publish() {
+        val next = when {
+            !linked -> State.Legacy
+            muted -> State.Muted
+            isCapturing -> State.Capturing
+            else -> State.Standby
+        }
+        if (next == state) return
+        state = next
+        onStateChanged?.invoke(next)
     }
 
     /** Drop all link/demand state when the stream disconnects. */
@@ -153,6 +212,8 @@ class CaptureGate(
         offDeadlineMs = null
         demandFalseSinceMs = null
         isCapturing = true
+        muted = false
+        publish()
     }
 
     private fun pruneOldEdges(now: Long) {

@@ -55,6 +55,11 @@
     <string name="microphone_not_recording">Microphone is not recording</string>
 
     <string name="connected_device">Connected Device:\n</string>
+    <!-- Pinned on-demand capture status line, shown above the log -->
+    <string name="capture_state_legacy">PC (legacy): always-on capture</string>
+    <string name="capture_state_standby">On-demand standby: microphone closed</string>
+    <string name="capture_state_capturing">Capturing: microphone open</string>
+    <string name="capture_state_muted">Muted: microphone closed</string>
     <string name="mic_start_recording">Microphone has started to record</string>
     <string name="unprocessed_not_supported">Unprocessed audio source is not supported on this device, using voice recognition instead</string>
 
