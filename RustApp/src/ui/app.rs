@@ -640,7 +640,11 @@ impl AppState {
     fn open_main_window(&mut self) -> Task<AppMsg> {
         let mut commands = Vec::new();
         let settings = window::Settings {
-            size: Size::new(800.0, 600.0),
+            // 600 was too short for the settings column once the automatic
+            // transport added the mode hints: the column measured ~590 logical
+            // pixels, so the Connect button and the status line fell outside the
+            // window and the column had to scroll. 700 leaves ~10 px of slack.
+            size: Size::new(800.0, 700.0),
             position: window::Position::Centered,
             icon: window_icon!("icon"),
             // Intercept the close request so on_close_requested can hide the
