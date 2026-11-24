@@ -12,7 +12,7 @@ use super::{
     AudioStream, ConnectError, StreamerTrait, TransportPath,
     adb_streamer::{
         self, DeviceKind, ensure_reverse_proxy, launch_android_app, probe_devices,
-        remove_adb_reverse_proxy, reverse_mapping_present,
+        remove_adb_reverse_proxy, reverse_mapping_present, start_adb_server,
     },
     tcp_streamer::{TcpStreamer, TcpStreamerState},
 };
@@ -77,6 +77,10 @@ fn spawn_device_watch(port: u16, fallback_ip: Option<IpAddr>) -> JoinHandle<()> 
         let mut adb_note: Option<String> = None;
         let mut device_note: Option<String> = None;
         let mut last_launch: Option<Instant> = None;
+
+        // Cold start: the first `adb devices` would otherwise have to launch the
+        // server itself and can block on the pipes the daemon inherits.
+        start_adb_server().await;
 
         loop {
             let devices = match probe_devices().await {

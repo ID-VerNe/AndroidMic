@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::net::IpAddr;
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -27,6 +28,9 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const ADB_REVERSE_ATTEMPTS: u32 = 3;
 /// base delay between reverse proxy rebuild attempts
 const ADB_REVERSE_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// upper bound for one `adb` invocation. A server-starting call can block on a
+/// pipe the daemon inherited, which is not a real answer to wait for.
+const ADB_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Android app package names. The debug build uses an `applicationIdSuffix`.
 pub(crate) const ANDROID_APP_PACKAGES: [&str; 2] = [
@@ -176,18 +180,55 @@ pub(crate) async fn exec_cmd(mut cmd: Command) -> Result<String, ConnectError> {
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000);
 
-    let status = cmd.output().await.map_err(ConnectError::CommandFailed)?;
+    // `adb devices` starts the server on demand, and the daemon it spawns
+    // inherits the stdout/stderr pipes that `output()` is reading. The client
+    // exits, the daemon keeps the write ends open, and the read never sees EOF:
+    // the caller blocks forever. Observed on a cold start (PC app launched
+    // before any adb server existed), where the Auto watcher then never polled
+    // again and the phone stayed on Wi-Fi. Bound the call so a cold start costs
+    // one tick instead of the whole session.
+    let output =
+        match tokio::time::timeout(ADB_CALL_TIMEOUT, cmd.kill_on_drop(true).output()).await {
+            Ok(result) => result.map_err(ConnectError::CommandFailed)?,
+            Err(_) => {
+                // Bring the daemon up detached so the retry talks to a live
+                // server instead of spawning another one behind our pipes.
+                start_adb_server().await;
+                return Err(ConnectError::AdbTimeout(ADB_CALL_TIMEOUT));
+            }
+        };
 
-    if !status.status.success() {
-        let stderr = String::from_utf8_lossy(&status.stderr).to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         return Err(ConnectError::AdbStatusCommand {
-            code: status.status.code(),
+            code: output.status.code(),
             stderr,
         });
     }
-    let stdout = String::from_utf8_lossy(&status.stdout).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(stdout)
+}
+
+/// Start the adb server without handing our pipes to the daemon.
+///
+/// Every `adb` call that finds no server spawns one, and that daemon inherits
+/// whatever handles the child was given. Pointing all three streams at
+/// `Stdio::null()` leaves nothing to inherit, so a cold start stays clean
+/// instead of hanging the first `output()` (see `exec_cmd`).
+pub async fn start_adb_server() {
+    let mut cmd = Command::new("adb");
+    cmd.arg("start-server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+
+    if let Err(e) = cmd.status().await {
+        debug!("can't start the adb server: {e}");
+    }
 }
 
 /// Install (or refresh) the reverse tunnel of one device.
@@ -256,12 +297,38 @@ async fn rebuild_reverse_proxies(port: u16) -> Result<(), ConnectError> {
     Err(last_error.unwrap_or(ConnectError::NoAdbDevice))
 }
 
+/// The package currently running on the phone, if either build is.
+///
+/// The release app and the debug build (`applicationIdSuffix`) can be installed
+/// side by side. Launching the wrong one is silent: the intent lands on an app
+/// that is not streaming, so the phone keeps its Wi-Fi connection instead of
+/// moving back to the tunnel after the cable is plugged in again.
+async fn running_package(device_id: &str) -> Option<&'static str> {
+    for package in ANDROID_APP_PACKAGES {
+        let mut cmd = Command::new("adb");
+        cmd.arg("-s")
+            .arg(device_id)
+            .arg("shell")
+            .arg("pidof")
+            .arg(package);
+
+        // `pidof` exits non-zero when nothing matches, so an error here just
+        // means "not running"; a ROM without `pidof` falls back to the default
+        // order instead of failing the launch.
+        if exec_cmd(cmd).await.is_ok_and(|pids| !pids.is_empty()) {
+            return Some(package);
+        }
+    }
+
+    None
+}
+
 /// Ask the phone app to come to the foreground and auto-connect. This is
 /// what removes the phone-side Connect tap when the app is not already open.
 /// The PC's LAN address and port ride along so an `Auto` phone can fall back to
-/// Wi-Fi without the user typing them. Release package first, debug build as a
-/// fallback; a missing package or a MIUI background-launch block only produces
-/// a warning.
+/// Wi-Fi without the user typing them. The running package goes first, the
+/// release build before the debug one otherwise; a missing package or a MIUI
+/// background-launch block only produces a warning.
 pub(crate) async fn launch_android_app(
     device_id: &str,
     fallback_ip: Option<IpAddr>,
@@ -269,7 +336,16 @@ pub(crate) async fn launch_android_app(
 ) -> Result<(), ConnectError> {
     let mut last_error = None;
 
+    // Dial the app that is actually on screen first; the fixed order only
+    // decides which one to try when neither is running.
+    let mut packages: Vec<&'static str> = running_package(device_id).await.into_iter().collect();
     for package in ANDROID_APP_PACKAGES {
+        if !packages.contains(&package) {
+            packages.push(package);
+        }
+    }
+
+    for package in packages {
         let mut cmd = Command::new("adb");
         cmd.arg("-s")
             .arg(device_id)
