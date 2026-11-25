@@ -203,6 +203,29 @@ impl TcpStreamer {
         self.peer
     }
 
+    /// Whether the live connection arrived over the LAN. A loopback peer can
+    /// only be the `adb reverse` tunnel, so a non-loopback peer means the phone
+    /// dialled the Wi-Fi address and holds a socket this machine cannot move to
+    /// the cable.
+    pub fn streaming_over_lan(&self) -> bool {
+        matches!(self.state, TcpStreamerState::Streaming { .. })
+            && self.peer.is_some_and(|peer| !peer.ip().is_loopback())
+    }
+
+    /// Close the live connection and go back to listening.
+    ///
+    /// Nothing is sent to the phone: it sees the same FIN it gets when the
+    /// cable is pulled, and its own reconnect walk re-dials the candidates in
+    /// order. In `Auto` that walk starts at loopback, so a peer that dropped a
+    /// LAN socket reconnects through the tunnel when one is up.
+    pub(crate) async fn drop_connection(&mut self) -> Result<Option<StreamerMsg>, ConnectError> {
+        if !matches!(self.state, TcpStreamerState::Streaming { .. }) {
+            return Ok(None);
+        }
+
+        self.relisten().await
+    }
+
     /// Message describing the live connection, with the transport derived from
     /// the actual peer: a loopback accept can only have arrived through the
     /// `adb reverse` tunnel.
