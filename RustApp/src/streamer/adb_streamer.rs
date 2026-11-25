@@ -226,8 +226,13 @@ pub async fn start_adb_server() {
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000);
 
-    if let Err(e) = cmd.status().await {
-        debug!("can't start the adb server: {e}");
+    // Same bound as any other call: the watcher calls this before its first
+    // poll, so an adb server that never becomes ready must not park the loop
+    // that is supposed to notice the device later.
+    match tokio::time::timeout(ADB_CALL_TIMEOUT, cmd.kill_on_drop(true).status()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => debug!("can't start the adb server: {e}"),
+        Err(_) => debug!("adb start-server did not finish within {ADB_CALL_TIMEOUT:?}"),
     }
 }
 

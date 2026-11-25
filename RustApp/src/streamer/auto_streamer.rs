@@ -295,8 +295,8 @@ impl StreamerTrait for AutoStreamer {
                 }
 
                 info!(
-                    "cable attached while streaming over Wi-Fi; closing the LAN connection \
-                     so the phone re-dials the tunnel"
+                    "wired path is available; closing the LAN connection so the phone \
+                     re-dials the tunnel"
                 );
                 self.tcp_streamer.drop_connection().await?
             }
