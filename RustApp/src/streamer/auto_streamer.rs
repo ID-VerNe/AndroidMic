@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -12,7 +14,7 @@ use super::{
     AudioStream, ConnectError, StreamerTrait, TransportPath,
     adb_streamer::{
         self, DeviceKind, ensure_reverse_proxy, launch_android_app, probe_devices,
-        remove_adb_reverse_proxy, reverse_mapping_present,
+        remove_adb_reverse_proxy, reverse_mapping_present, start_adb_server,
     },
     tcp_streamer::{TcpStreamer, TcpStreamerState},
 };
@@ -37,6 +39,8 @@ pub struct AutoStreamer {
     device_watch: JoinHandle<()>,
     /// LAN address the phone is told to use once the cable is out
     fallback_ip: Option<IpAddr>,
+    /// raised by the watcher when a cable appeared or its tunnel came back
+    usb_kick: Arc<Notify>,
 }
 
 /// Log `note` only when it differs from the previous one, so a cable that stays
@@ -70,13 +74,21 @@ fn note_once(last: &mut Option<String>, note: String) {
 /// Attach and detach are edges; a tunnel that vanished under a still-attached
 /// device (`adb kill-server`, server restart, tunnel GC) is repaired on the
 /// next tick because the mapping is verified, not just the device list.
-fn spawn_device_watch(port: u16, fallback_ip: Option<IpAddr>) -> JoinHandle<()> {
+fn spawn_device_watch(
+    port: u16,
+    fallback_ip: Option<IpAddr>,
+    usb_kick: Arc<Notify>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut attached: Vec<String> = Vec::new();
         // tracker per failure category: clearing one must not silence another
         let mut adb_note: Option<String> = None;
         let mut device_note: Option<String> = None;
         let mut last_launch: Option<Instant> = None;
+
+        // Cold start: the first `adb devices` would otherwise have to launch the
+        // server itself and can block on the pipes the daemon inherits.
+        start_adb_server().await;
 
         loop {
             let devices = match probe_devices().await {
@@ -112,6 +124,12 @@ fn spawn_device_watch(port: u16, fallback_ip: Option<IpAddr>) -> JoinHandle<()> 
                         match ensure_reverse_proxy(serial, port).await {
                             Ok(()) => {
                                 device_note = None;
+                                // The phone cannot see the cable, so a stream
+                                // already running over Wi-Fi has to be told by
+                                // the only side that noticed the attach. Raise
+                                // the kick only once the tunnel is up, so the
+                                // phone's re-dial finds loopback serviceable.
+                                usb_kick.notify_one();
                                 launch_throttled(
                                     serial,
                                     fallback_ip,
@@ -134,6 +152,10 @@ fn spawn_device_watch(port: u16, fallback_ip: Option<IpAddr>) -> JoinHandle<()> 
                                 match ensure_reverse_proxy(serial, port).await {
                                     Ok(()) => {
                                         device_note = None;
+                                        // Same edge as an attach: the tunnel is
+                                        // usable again, so a Wi-Fi stream has a
+                                        // wired path to move to.
+                                        usb_kick.notify_one();
                                         // The tunnel coming back does not mean the
                                         // phone is still streaming: an adb server
                                         // restart took the app down with it.
@@ -224,12 +246,14 @@ pub async fn new(
         ),
     }
 
-    let device_watch = spawn_device_watch(port, fallback_ip);
+    let usb_kick = Arc::new(Notify::new());
+    let device_watch = spawn_device_watch(port, fallback_ip, usb_kick.clone());
 
     Ok(AutoStreamer {
         tcp_streamer,
         device_watch,
         fallback_ip,
+        usb_kick,
     })
 }
 
@@ -248,7 +272,36 @@ impl AutoStreamer {
 impl StreamerTrait for AutoStreamer {
     async fn next(&mut self) -> Result<Option<StreamerMsg>, ConnectError> {
         let was_streaming = matches!(&self.tcp_streamer.state, TcpStreamerState::Streaming { .. });
-        let msg = self.tcp_streamer.next().await?;
+
+        // A cable that appears mid-stream cannot be picked up by the phone: it
+        // holds a live socket to the LAN address and, with no way to observe
+        // the cable, keeps using it. Asking the app through an `am start`
+        // intent is not a fix — the restart depends on activity lifecycle and
+        // a background activity launch is refused outright. The PC owns both
+        // ends of the decision, so it closes the socket instead: the phone
+        // takes the drop as a lost link, and its `Auto` reconnect walk tries
+        // loopback before the LAN address, i.e. the tunnel built on attach.
+        // Own handle, so the select holds no borrow of `self` while the other
+        // arm borrows the streamer mutably.
+        let kick = self.usb_kick.clone();
+        let msg = tokio::select! {
+            // The kick wins over a frame that arrived at the same time: the
+            // audio path is about to be replaced anyway.
+            biased;
+            _ = kick.notified() => {
+                if !self.tcp_streamer.streaming_over_lan() {
+                    // Listening, or already on the tunnel: nothing to move.
+                    return Ok(None);
+                }
+
+                info!(
+                    "wired path is available; closing the LAN connection so the phone \
+                     re-dials the tunnel"
+                );
+                self.tcp_streamer.drop_connection().await?
+            }
+            msg = self.tcp_streamer.next() => msg?,
+        };
 
         if was_streaming && matches!(msg, Some(StreamerMsg::Listening { .. })) {
             info!("connection dropped; the wildcard listener is back up, dial in over USB or Wi-Fi");

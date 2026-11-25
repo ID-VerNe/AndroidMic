@@ -2,7 +2,7 @@ use anyhow::Result;
 use enum_dispatch::enum_dispatch;
 use prost::DecodeError;
 use rtrb::chunks::ChunkError;
-use std::{fmt::Debug, io};
+use std::{fmt::Debug, io, time::Duration};
 use tcp_streamer::TcpStreamer;
 use thiserror::Error;
 use udp_streamer::UdpStreamer;
@@ -143,6 +143,8 @@ enum ConnectError {
     AdbStatusCommand { code: Option<i32>, stderr: String },
     #[error("command failed: {0} make sure adb is installed and in your PATH")]
     CommandFailed(io::Error),
+    #[error("adb did not answer within {0:?}")]
+    AdbTimeout(Duration),
     #[error("Handshake failed: {0} {1}")]
     HandShakeFailed(&'static str, io::Error),
     #[error("Handshake failed: {0}")]
