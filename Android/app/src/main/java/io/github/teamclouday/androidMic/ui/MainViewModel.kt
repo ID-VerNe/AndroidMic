@@ -267,16 +267,15 @@ class MainViewModel : ViewModel() {
             explicitAutoConnectRequest = true
             pendingAutoConnect = true
 
-            // The PC only pushes the endpoint when a cable was just attached, so
-            // a running AUTO stream is on Wi-Fi: restart it to move back to the
-            // wired path without the user touching anything (AC3). The reply
-            // handler re-arms `maybeAutoConnect` once the service reports the
-            // stream stopped.
-            if (isStreamStarted.value && prefs.mode.get() == Mode.AUTO) {
-                Log.d(TAG, "auto: cable attached while streaming, restarting for the USB path")
-                val stop = CommandData(Command.StopStream).toCommandMsg()
-                stop.replyTo = messenger
-                service?.send(stop)
+            // An intent while a stream is already up is a no-op. The PC closes
+            // the connection itself when the cable comes back and the transport
+            // walk re-dials loopback first, so restarting from here only adds a
+            // second drop — and the intent arrives on every attach edge, so it
+            // would tear down a wired stream that is already where it belongs.
+            if (isStreamStarted.value) {
+                Log.d(TAG, "auto: stream already running, leaving it alone")
+                explicitAutoConnectRequest = false
+                pendingAutoConnect = false
                 return@launch
             }
 
